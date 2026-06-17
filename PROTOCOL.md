@@ -40,17 +40,30 @@ Merged does not parse these — both extensions must agree on them. Always inclu
   "v": 1,
   "kind": "open",
   "moveId": "f1c2…",
+  "asWindow": true,
   "tabs": [
     { "url": "https://…", "active": true, "scrollX": 0, "scrollY": 1280, "videoTime": 87.5 }
   ]
 }
 ```
 
-- `moveId` — unique per teleport; echoed back in the `ack` so the sender knows which tab to close.
-- `tabs` — one or more tabs (v1 senders may send just one). Fields beyond `url` are
-  best-effort restore hints; a receiver restores what it can and ignores the rest.
+- `moveId` — unique per teleport; echoed back in the `ack` so the sender knows what to close.
+- `asWindow` — when true the receiver opens all `tabs` as a **new window** (a dragged
+  browser window); when false/absent it opens `tabs[0]` as a single tab (a one-tab send).
+- `tabs` — one or more tabs. Fields beyond `url` are best-effort restore hints; a receiver
+  restores what it can and ignores the rest. `active` marks the tab to focus.
 - `videoTime` — seconds into the first `<video>`. (Chrome also bakes YouTube time into
   the URL via `&t=Ns` since that restores most reliably.)
+
+### `capture-window` — (Merged → its LOCAL extension only)
+
+```json
+{ "v": 1, "kind": "capture-window" }
+```
+
+Not a peer message: Merged pushes this to the extension on the *same* computer when it
+detects a browser window dragged across the screen seam. The extension captures the
+focused window's tabs and sends them to the peer as an `open` with `asWindow: true`.
 
 ### `ack` — "I opened it; you may close yours"
 
@@ -58,9 +71,9 @@ Merged does not parse these — both extensions must agree on them. Always inclu
 { "v": 1, "kind": "ack", "moveId": "f1c2…" }
 ```
 
-The receiver sends this once the tab is open (and after a best-effort state restore).
-The original sender then closes the source tab. If no `ack` arrives, the sender keeps
-its tab (nothing is lost).
+The receiver sends this once the tab/window is open. The original sender then closes the
+source tab (or whole window, for an `asWindow` move). If no `ack` arrives, the sender keeps
+it (nothing is lost).
 
 ## Fidelity
 

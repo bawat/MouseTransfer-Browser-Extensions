@@ -108,6 +108,12 @@ function isYouTube(url) {
   return url.includes("youtube.com/watch") || url.includes("youtu.be/");
 }
 
+// For YouTube the &t= param is the most reliable restore, so bake the time into the URL.
+function bakeYouTubeTime(url, seconds) {
+  url = url.replace(/([?&])t=\d+s?(&|$)/, "$1").replace(/[?&]$/, "");
+  return url + (url.includes("?") ? "&" : "?") + `t=${Math.floor(seconds)}s`;
+}
+
 // Injected into the page to read restorable state.
 function readPageState() {
   let videoTime = 0;
@@ -115,30 +121,48 @@ function readPageState() {
   return { scrollX: window.scrollX || 0, scrollY: window.scrollY || 0, videoTime };
 }
 
-async function teleportTab(tab) {
-  if (!tab || !tab.url || !/^https?:/i.test(tab.url)) {
-    console.warn("Teleporter: only http(s) tabs can be teleported");
-    return;
-  }
+// captureTab snapshots one tab into a transferable payload (url + restore hints), or null
+// for a non-http(s) tab (e.g. chrome://, where we can't inject and that wouldn't restore).
+async function captureTab(tab) {
+  if (!tab || !tab.url || !/^https?:/i.test(tab.url)) return null;
   let state = { scrollX: 0, scrollY: 0, videoTime: 0 };
   try {
     const out = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: readPageState });
     if (out && out[0] && out[0].result) state = out[0].result;
-  } catch (e) { /* e.g. a restricted page; fall back to no state */ }
-
-  // For YouTube the &t= param is the most reliable restore, so bake the time into the URL.
+  } catch (e) { /* restricted/unloaded tab; carry just the url */ }
   let url = tab.url;
-  if (state.videoTime > 0 && isYouTube(url)) {
-    url = url.replace(/([?&])t=\d+s?(&|$)/, "$1").replace(/[?&]$/, "");
-    url += (url.includes("?") ? "&" : "?") + `t=${Math.floor(state.videoTime)}s`;
-  }
+  if (state.videoTime > 0 && isYouTube(url)) url = bakeYouTubeTime(url, state.videoTime);
+  return { url, active: !!tab.active, scrollX: state.scrollX, scrollY: state.scrollY, videoTime: state.videoTime };
+}
 
+// teleportTab sends a single tab (the Phase-1 shortcut/context-menu path).
+async function teleportTab(tab) {
+  const t = await captureTab(tab);
+  if (!t) { console.warn("Teleporter: only http(s) tabs can be teleported"); return; }
   const moveId = crypto.randomUUID();
-  pendingClose.set(moveId, tab.id);
-  const env = { v: 1, kind: "open", moveId, tabs: [{ url, active: true, scrollX: state.scrollX, scrollY: state.scrollY, videoTime: state.videoTime }] };
-  const ok = await sendEnvelope(env);
+  pendingClose.set(moveId, { type: "tab", id: tab.id });
+  const ok = await sendEnvelope({ v: 1, kind: "open", moveId, tabs: [t] });
   if (!ok) pendingClose.delete(moveId);
-  else console.log("Teleporter: sent", url);
+  else console.log("Teleporter: sent tab", t.url);
+}
+
+// teleportFocusedWindow sends EVERY http(s) tab of the focused window as one window-move.
+// Invoked when Merged reports a Chrome window was dragged across the seam (capture-window).
+// The dragged window is the focused one, so getLastFocused identifies it.
+async function teleportFocusedWindow() {
+  const win = await chrome.windows.getLastFocused({ populate: true });
+  if (!win || !win.tabs || !win.tabs.length) return;
+  const tabs = [];
+  for (const tab of win.tabs) {
+    const t = await captureTab(tab);
+    if (t) tabs.push(t);
+  }
+  if (!tabs.length) { console.warn("Teleporter: no http(s) tabs in the dragged window"); return; }
+  const moveId = crypto.randomUUID();
+  pendingClose.set(moveId, { type: "window", id: win.id });
+  const ok = await sendEnvelope({ v: 1, kind: "open", moveId, asWindow: true, tabs });
+  if (!ok) pendingClose.delete(moveId);
+  else console.log("Teleporter: sent window with", tabs.length, "tab(s)");
 }
 
 // ---------------- receive (peer -> this machine) ----------------
@@ -154,35 +178,59 @@ function restorePageState(state) {
   } catch (e) {}
 }
 
+// scheduleRestore re-applies a tab's scroll/video state once it finishes loading,
+// independently of the ack (so the source side never waits on it).
+function scheduleRestore(tabId, t) {
+  if (!tabId || !(t.scrollX || t.scrollY || t.videoTime)) return;
+  const onUpdated = (id, info) => {
+    if (id !== tabId || info.status !== "complete") return;
+    chrome.tabs.onUpdated.removeListener(onUpdated);
+    chrome.scripting.executeScript({ target: { tabId: id }, func: restorePageState, args: [{ scrollX: t.scrollX || 0, scrollY: t.scrollY || 0, videoTime: t.videoTime || 0 }] }).catch(() => {});
+  };
+  chrome.tabs.onUpdated.addListener(onUpdated);
+  setTimeout(() => chrome.tabs.onUpdated.removeListener(onUpdated), 20000); // stop listening eventually
+}
+
 async function handleEnvelope(env) {
   if (!env || env.v !== 1) return;
 
-  if (env.kind === "open") {
-    const t = (env.tabs && env.tabs[0]) || null;
-    if (!t || !t.url) return;
-    const newTab = await chrome.tabs.create({ url: t.url, active: true });
-    // Ack IMMEDIATELY: the tab exists, so the move has succeeded — the source should close
-    // its tab now rather than wait for the page to load (that wait was the ~5s lag). The
-    // scroll/video restore below runs independently once the page reports "complete".
-    sendEnvelope({ v: 1, kind: "ack", moveId: env.moveId });
+  // Merged tells us a Chrome window was dragged across the seam: capture+send it.
+  if (env.kind === "capture-window") { await teleportFocusedWindow(); return; }
 
-    if (t.scrollX || t.scrollY || t.videoTime) {
-      const onUpdated = (tabId, info) => {
-        if (tabId !== newTab.id || info.status !== "complete") return;
-        chrome.tabs.onUpdated.removeListener(onUpdated);
-        chrome.scripting.executeScript({ target: { tabId: newTab.id }, func: restorePageState, args: [{ scrollX: t.scrollX || 0, scrollY: t.scrollY || 0, videoTime: t.videoTime || 0 }] }).catch(() => {});
-      };
-      chrome.tabs.onUpdated.addListener(onUpdated);
-      setTimeout(() => chrome.tabs.onUpdated.removeListener(onUpdated), 20000); // stop listening eventually
+  if (env.kind === "open") {
+    const tabs = (env.tabs || []).filter((t) => t && t.url);
+    if (!tabs.length) return;
+
+    if (env.asWindow) {
+      // Whole-window teleport: open a new window with the first tab, add the rest, then
+      // re-activate whichever was active on the source.
+      const win = await chrome.windows.create({ url: tabs[0].url, focused: true });
+      const firstId = win.tabs && win.tabs[0] && win.tabs[0].id;
+      scheduleRestore(firstId, tabs[0]);
+      let activeId = tabs[0].active ? firstId : null;
+      for (let i = 1; i < tabs.length; i++) {
+        const nt = await chrome.tabs.create({ windowId: win.id, url: tabs[i].url, active: false });
+        scheduleRestore(nt.id, tabs[i]);
+        if (tabs[i].active) activeId = nt.id;
+      }
+      if (activeId) chrome.tabs.update(activeId, { active: true }).catch(() => {});
+    } else {
+      const newTab = await chrome.tabs.create({ url: tabs[0].url, active: true });
+      scheduleRestore(newTab.id, tabs[0]);
     }
+
+    // Ack IMMEDIATELY: the tab(s) exist, so the move has succeeded — the source should close
+    // now rather than wait for pages to load (that wait was the ~5s lag).
+    sendEnvelope({ v: 1, kind: "ack", moveId: env.moveId });
     return;
   }
 
   if (env.kind === "ack") {
-    const tabId = pendingClose.get(env.moveId);
-    if (tabId !== undefined) {
+    const target = pendingClose.get(env.moveId);
+    if (target) {
       pendingClose.delete(env.moveId);
-      chrome.tabs.remove(tabId).catch(() => {});
+      if (target.type === "window") chrome.windows.remove(target.id).catch(() => {});
+      else chrome.tabs.remove(target.id).catch(() => {});
     }
   }
 }
