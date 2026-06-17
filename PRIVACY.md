@@ -90,6 +90,6 @@ date.
 
 For questions about this policy or the extension, contact:
 
-**[YOUR NAME OR BUSINESS NAME]**
-**[YOUR CONTACT EMAIL]**
-**[YOUR POSTAL/BUSINESS ADDRESS — required if you registered as a "trader"]**
+**Mark Macheta**
+**bawat@hotmail.co.uk**
+**99 Kingston Road, Coventry, CV5 6LQ**
