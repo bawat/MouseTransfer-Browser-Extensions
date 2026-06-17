@@ -240,9 +240,27 @@ async function handleEnvelope(env) {
     const target = pendingClose.get(env.moveId);
     if (target) {
       pendingClose.delete(env.moveId);
-      if (target.type === "window") chrome.windows.remove(target.id).catch(() => {});
-      else chrome.tabs.remove(target.id).catch(() => {});
+      closeWhenPossible(target);
     }
+  }
+}
+
+// closeWhenPossible removes the source tab/window once Chrome lets it. If the window was
+// dragged by a TAB (rather than the title bar), Chrome holds a tab-drag session with the
+// mouse captured and silently refuses windows.remove until the user releases — so a single
+// remove no-ops and the window lingers. Retry until it's actually gone (verified via
+// get() throwing), which naturally succeeds the moment the drag is released.
+async function closeWhenPossible(target) {
+  for (let i = 0; i < 30; i++) { // ~15s ceiling
+    try {
+      if (target.type === "window") await chrome.windows.remove(target.id);
+      else await chrome.tabs.remove(target.id);
+    } catch (e) { /* may be mid tab-drag; verify below and retry */ }
+    try {
+      if (target.type === "window") await chrome.windows.get(target.id);
+      else await chrome.tabs.get(target.id);
+    } catch (e) { return; } // get() threw → it's gone → done
+    await sleep(500);
   }
 }
 
