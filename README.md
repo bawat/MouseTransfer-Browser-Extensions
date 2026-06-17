@@ -11,33 +11,34 @@ That means **adding a new browser is a JavaScript-only PR** — see [PROTOCOL.md
 
 ## Browsers
 
-| Folder | Browsers |
-|---|---|
-| [`chrome/`](chrome/) | Chrome, Edge, Brave, and other Chromium browsers (Manifest V3) |
+| Folder | Engine | Browsers |
+|---|---|---|
+| [`chrome/`](chrome/) | Chromium (MV3) | Chrome, Edge, Brave, Opera, Vivaldi, Yandex, Samsung Internet, … |
+| [`firefox/`](firefox/) | Gecko (MV3) | Firefox (desktop + Android) and forks |
+| [`safari/`](safari/) | WebKit | Safari (macOS/iOS) — built via Xcode |
 
-Want Firefox/Safari/etc.? Implement [PROTOCOL.md](PROTOCOL.md) in a new folder and open a PR.
+Three engine builds cover the top browsers — see [BROWSERS.md](BROWSERS.md) for the full
+per-browser mapping and per-store submission notes. Adding another engine is a JS-only PR
+against [PROTOCOL.md](PROTOCOL.md).
 
-## Install (Chrome)
+## Install (Chrome / Chromium, unpacked)
 
 1. Run Merged on **both** computers (`merged serve` on one, `merged connect <host>` on the
-   other). On startup each logs a line like:
-   `browser-tab teleport ready  endpoint=http://127.0.0.1:24812  token=<hex>`
-   (the token is also saved as `browserlink-token` in the Merged config folder).
+   other). It exposes the local bridge automatically.
 2. On each computer: open `chrome://extensions`, enable **Developer mode**, click
    **Load unpacked**, and select this repo's `chrome/` folder.
-3. Right-click the extension → **Options**. Enter that computer's bridge endpoint and
-   token, then **Save**. (Each computer uses its own local token.)
+
+That's it — the extension **auto-configures** itself from the local Merged bridge (no token to
+paste). For Firefox use `about:debugging` → *Load Temporary Add-on* → `firefox/manifest.json`;
+for Safari see [safari/README.md](safari/README.md). Once the Chrome Web Store listing is live,
+Merged can force-install it for you (`merged browser-install`, or automatically on launch).
 
 ## Use
 
-Open a tab, then **teleport it** via any of:
-- click the extension's toolbar icon,
-- the **Ctrl+Shift+Y** shortcut, or
-- right-click the page → **Teleport this tab to the other computer**.
-
-The tab opens on the other computer (restored to the same video time / scroll) and closes
-here. A future Merged release will add the physical "drag the tab across the screen edge"
-gesture on top of this same protocol.
+**Drag a browser window across the screen seam** to the other computer — it teleports there
+(all its tabs, restored to the same video time / scroll) and closes here, riding the cursor
+until you drop it. You can also teleport the active tab via the toolbar icon, the
+**Ctrl+Shift+Y** shortcut, or right-click → **Teleport this tab to the other computer**.
 
 ## What carries (and what doesn't)
 

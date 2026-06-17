@@ -1,0 +1,316 @@
+// Cross-engine shim: Firefox/Safari expose promise-based APIs on `browser`; their `chrome`
+// namespace is callback-style, which the promise/await code below would break on. Point
+// `chrome` at `browser` so the identical code runs unchanged. No-op on Chromium (no `browser`).
+if (typeof browser !== "undefined") { globalThis.chrome = browser; }
+
+// background.js — Tab Teleporter (Merged)
+//
+// Talks to the LOCAL Merged bridge over loopback HTTP (no separate server, no off-box
+// port): merged.exe relays our envelopes to the peer machine over its encrypted channel.
+//   - POST {endpoint}/send?token=...   to send an envelope to the other computer
+//   - GET  {endpoint}/events?token=... long-poll for envelopes from the other computer
+//
+// Envelope protocol (see PROTOCOL.md) — the Go side treats this as opaque:
+//   open: { v:1, kind:"open", moveId, tabs:[{url, active, scrollX, scrollY, videoTime}] }
+//   ack : { v:1, kind:"ack",  moveId }
+// The receiver opens+restores the tab and replies "ack"; the sender then closes its tab.
+
+const DEFAULT_ENDPOINT = "http://127.0.0.1:24812";
+
+let cfg = { endpoint: DEFAULT_ENDPOINT, token: "" };
+
+// moveId -> source tabId, so an incoming ack closes exactly the tab we teleported.
+const pendingClose = new Map();
+
+// ---------------- config ----------------
+
+async function loadConfig() {
+  const local = await chrome.storage.local.get(["endpoint", "token"]);
+  cfg.endpoint = (local.endpoint || DEFAULT_ENDPOINT).replace(/\/+$/, "");
+  cfg.token = local.token || "";
+}
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === "local" && (changes.endpoint || changes.token)) loadConfig();
+});
+
+// ensureToken auto-fetches the per-install token from the local Merged bridge so the user
+// never has to paste it. /hello only answers our extension (it requires the custom
+// X-Teleport-Client header, which a web page can't send without a CORS preflight the
+// bridge refuses; our host_permissions for 127.0.0.1 let us send it directly). If this
+// can't reach the bridge, the user can still set the token manually in Options.
+// Fixed protocol token the bridge's /hello requires (NOT the extension id — so it works
+// whether we're load-unpacked or Web-Store-published with a store-assigned id).
+const HELLO_CLIENT = "merged-tab-teleporter";
+// When this worker started — used to ignore a stale "reload" right after we just reloaded
+// (prevents a reload loop if the command is redelivered to the fresh worker).
+const STARTED_AT = Date.now();
+async function ensureToken() {
+  if (cfg.token) return true;
+  try {
+    const res = await fetch(`${cfg.endpoint}/hello`, {
+      method: "POST",
+      headers: { "X-Teleport-Client": HELLO_CLIENT },
+    });
+    if (res.ok) {
+      const j = await res.json();
+      if (j && j.token) {
+        cfg.token = j.token;
+        await chrome.storage.local.set({ token: j.token, endpoint: cfg.endpoint });
+        console.log("Teleporter: auto-configured from the Merged bridge");
+        return true;
+      }
+    }
+  } catch (e) { /* bridge not up yet; pollLoop will retry via ensureToken */ }
+  return false;
+}
+
+function q(path) {
+  return `${cfg.endpoint}${path}?token=${encodeURIComponent(cfg.token)}`;
+}
+
+// ---------------- transport ----------------
+
+async function sendEnvelope(env) {
+  if (!cfg.token) await ensureToken();
+  if (!cfg.token) { console.warn("Teleporter: no token (is merged running?)"); return false; }
+  try {
+    const res = await fetch(q("/send"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(env),
+    });
+    if (!res.ok) { console.warn("Teleporter: send failed", res.status); return false; }
+    return true;
+  } catch (e) {
+    console.warn("Teleporter: bridge unreachable (is merged running?)", e);
+    return false;
+  }
+}
+
+// pollLoop long-polls the bridge forever, handling each envelope from the peer. A 204
+// (idle timeout) or a transient error just re-polls; the MV3 worker is kept alive by the
+// in-flight fetch, and onMessage/alarms restart this if the worker was ever evicted.
+let polling = false;
+async function pollLoop() {
+  if (polling) return;
+  polling = true;
+  for (;;) {
+    if (!cfg.token) { await ensureToken(); if (!cfg.token) { await sleep(2000); continue; } }
+    try {
+      const res = await fetch(q("/events"));
+      if (res.status === 200) {
+        const env = await res.json();
+        await handleEnvelope(env);
+      } else if (res.status !== 204) {
+        await sleep(2000);
+      }
+    } catch (e) {
+      await sleep(3000); // bridge down; back off and retry
+    }
+  }
+}
+
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+// ---------------- capture (this machine -> peer) ----------------
+
+function isYouTube(url) {
+  return url.includes("youtube.com/watch") || url.includes("youtu.be/");
+}
+
+// For YouTube the &t= param is the most reliable restore, so bake the time into the URL.
+function bakeYouTubeTime(url, seconds) {
+  url = url.replace(/([?&])t=\d+s?(&|$)/, "$1").replace(/[?&]$/, "");
+  return url + (url.includes("?") ? "&" : "?") + `t=${Math.floor(seconds)}s`;
+}
+
+// Injected into the page to read restorable state.
+function readPageState() {
+  let videoTime = 0;
+  try { const v = document.querySelector("video"); if (v && v.currentTime > 0) videoTime = v.currentTime; } catch (e) {}
+  return { scrollX: window.scrollX || 0, scrollY: window.scrollY || 0, videoTime };
+}
+
+// captureTab snapshots one tab into a transferable payload (url + restore hints), or null
+// for a non-http(s) tab (e.g. chrome://, where we can't inject and that wouldn't restore).
+async function captureTab(tab) {
+  if (!tab || !tab.url || !/^https?:/i.test(tab.url)) return null;
+  let state = { scrollX: 0, scrollY: 0, videoTime: 0 };
+  try {
+    const out = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: readPageState });
+    if (out && out[0] && out[0].result) state = out[0].result;
+  } catch (e) { /* restricted/unloaded tab; carry just the url */ }
+  let url = tab.url;
+  if (state.videoTime > 0 && isYouTube(url)) url = bakeYouTubeTime(url, state.videoTime);
+  return { url, active: !!tab.active, scrollX: state.scrollX, scrollY: state.scrollY, videoTime: state.videoTime };
+}
+
+// teleportTab sends a single tab (the Phase-1 shortcut/context-menu path).
+async function teleportTab(tab) {
+  const t = await captureTab(tab);
+  if (!t) { console.warn("Teleporter: only http(s) tabs can be teleported"); return; }
+  const moveId = crypto.randomUUID();
+  pendingClose.set(moveId, { type: "tab", id: tab.id });
+  const ok = await sendEnvelope({ v: 1, kind: "open", moveId, tabs: [t] });
+  if (!ok) pendingClose.delete(moveId);
+  else console.log("Teleporter: sent tab", t.url);
+}
+
+// teleportFocusedWindow sends EVERY http(s) tab of the focused window as one window-move.
+// Invoked when Merged reports a Chrome window was dragged across the seam (capture-window).
+// The dragged window is the focused one, so getLastFocused identifies it.
+async function teleportFocusedWindow() {
+  const win = await chrome.windows.getLastFocused({ populate: true });
+  if (!win || !win.tabs || !win.tabs.length) return;
+  const tabs = [];
+  for (const tab of win.tabs) {
+    const t = await captureTab(tab);
+    if (t) tabs.push(t);
+  }
+  if (!tabs.length) { console.warn("Teleporter: no http(s) tabs in the dragged window"); return; }
+  const moveId = crypto.randomUUID();
+  pendingClose.set(moveId, { type: "window", id: win.id });
+  const ok = await sendEnvelope({ v: 1, kind: "open", moveId, asWindow: true, tabs });
+  if (!ok) pendingClose.delete(moveId);
+  else console.log("Teleporter: sent window with", tabs.length, "tab(s)");
+}
+
+// ---------------- receive (peer -> this machine) ----------------
+
+// Injected after the teleported tab loads, to restore scroll/video position.
+function restorePageState(state) {
+  try {
+    if (state.scrollX || state.scrollY) window.scrollTo(state.scrollX || 0, state.scrollY || 0);
+    if (state.videoTime > 0) {
+      const v = document.querySelector("video");
+      if (v) { try { v.currentTime = state.videoTime; } catch (e) {} }
+    }
+  } catch (e) {}
+}
+
+// scheduleRestore re-applies a tab's scroll/video state once it finishes loading,
+// independently of the ack (so the source side never waits on it).
+function scheduleRestore(tabId, t) {
+  if (!tabId || !(t.scrollX || t.scrollY || t.videoTime)) return;
+  const onUpdated = (id, info) => {
+    if (id !== tabId || info.status !== "complete") return;
+    chrome.tabs.onUpdated.removeListener(onUpdated);
+    chrome.scripting.executeScript({ target: { tabId: id }, func: restorePageState, args: [{ scrollX: t.scrollX || 0, scrollY: t.scrollY || 0, videoTime: t.videoTime || 0 }] }).catch(() => {});
+  };
+  chrome.tabs.onUpdated.addListener(onUpdated);
+  setTimeout(() => chrome.tabs.onUpdated.removeListener(onUpdated), 20000); // stop listening eventually
+}
+
+async function handleEnvelope(env) {
+  if (!env || env.v !== 1) return;
+
+  // Dev auto-reload: Merged watches the extension folder and sends this when it changes
+  // (e.g. after a git pull), so we re-read the new files from disk. Ignore for the first
+  // few seconds after a reload so a redelivered command can't loop.
+  if (env.kind === "reload") {
+    if (Date.now() - STARTED_AT > 3000) { console.log("Teleporter: reloading (source changed)"); chrome.runtime.reload(); }
+    return;
+  }
+
+  // Merged tells us a Chrome window was dragged across the seam: capture+send it.
+  if (env.kind === "capture-window") { await teleportFocusedWindow(); return; }
+
+  if (env.kind === "open") {
+    const tabs = (env.tabs || []).filter((t) => t && t.url);
+    if (!tabs.length) return;
+
+    if (env.asWindow) {
+      // Whole-window teleport: open a new window with the first tab, add the rest, then
+      // re-activate whichever was active on the source.
+      const win = await chrome.windows.create({ url: tabs[0].url, focused: true });
+      const firstId = win.tabs && win.tabs[0] && win.tabs[0].id;
+      scheduleRestore(firstId, tabs[0]);
+      let activeId = tabs[0].active ? firstId : null;
+      for (let i = 1; i < tabs.length; i++) {
+        const nt = await chrome.tabs.create({ windowId: win.id, url: tabs[i].url, active: false });
+        scheduleRestore(nt.id, tabs[i]);
+        if (tabs[i].active) activeId = nt.id;
+      }
+      if (activeId) chrome.tabs.update(activeId, { active: true }).catch(() => {});
+    } else {
+      const newTab = await chrome.tabs.create({ url: tabs[0].url, active: true });
+      scheduleRestore(newTab.id, tabs[0]);
+    }
+
+    // Ack IMMEDIATELY: the tab(s) exist, so the move has succeeded — the source should close
+    // now rather than wait for pages to load (that wait was the ~5s lag).
+    sendEnvelope({ v: 1, kind: "ack", moveId: env.moveId });
+    return;
+  }
+
+  if (env.kind === "ack") {
+    const target = pendingClose.get(env.moveId);
+    if (target) {
+      pendingClose.delete(env.moveId);
+      closeWhenPossible(target);
+    }
+  }
+}
+
+// closeWhenPossible removes the source tab/window once Chrome lets it. If the window was
+// dragged by a TAB (rather than the title bar), Chrome holds a tab-drag session with the
+// mouse captured and silently refuses windows.remove until the user releases — so a single
+// remove no-ops and the window lingers. Retry until it's actually gone (verified via
+// get() throwing), which naturally succeeds the moment the drag is released.
+async function closeWhenPossible(target) {
+  for (let i = 0; i < 30; i++) { // ~15s ceiling
+    try {
+      if (target.type === "window") await chrome.windows.remove(target.id);
+      else await chrome.tabs.remove(target.id);
+    } catch (e) { /* may be mid tab-drag; verify below and retry */ }
+    try {
+      if (target.type === "window") await chrome.windows.get(target.id);
+      else await chrome.tabs.get(target.id);
+    } catch (e) { return; } // get() threw → it's gone → done
+    await sleep(500);
+  }
+}
+
+// ---------------- triggers ----------------
+
+async function teleportActive() {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (tab) teleportTab(tab);
+}
+
+chrome.action.onClicked.addListener(() => teleportActive());
+chrome.commands.onCommand.addListener((cmd) => { if (cmd === "teleport-tab") teleportActive(); });
+
+chrome.runtime.onInstalled.addListener(() => {
+  chrome.contextMenus.create({ id: "teleport-tab", title: "Teleport this tab to the other computer", contexts: ["page"] }, () => void chrome.runtime.lastError);
+});
+chrome.contextMenus.onClicked.addListener((info, tab) => { if (info.menuItemId === "teleport-tab") teleportTab(tab); });
+
+// ---------------- keep-alive ----------------
+//
+// The whole feature depends on the service worker continuously polling /events so a pushed
+// command (capture-window) is received instantly. But MV3 suspends the worker after ~30s
+// idle — even with a pending fetch — which stalled pushes by ~30s (commands piled up in the
+// bridge until the worker woke). Two layers keep it alive:
+//   1) a chrome.* API call every 20s resets the 30s idle timer, so the worker never sleeps;
+//   2) an alarm (coarse, survives an actual eviction) re-enters pollLoop as a backstop.
+let keepAliveTimer = null;
+function startKeepAlive() {
+  if (keepAliveTimer) return;
+  keepAliveTimer = setInterval(() => {
+    // Any extension API call resets the suspension timer; getPlatformInfo is a cheap no-op.
+    chrome.runtime.getPlatformInfo(() => void chrome.runtime.lastError);
+  }, 20000);
+}
+
+// ---------------- boot ----------------
+
+if (chrome.alarms) {
+  chrome.alarms.create("keepalive", { periodInMinutes: 0.5 }); // backstop if the worker ever dies
+  chrome.alarms.onAlarm.addListener(() => { startKeepAlive(); pollLoop(); });
+}
+chrome.runtime.onStartup.addListener(() => boot());
+chrome.runtime.onInstalled.addListener(() => boot());
+
+async function boot() { startKeepAlive(); await loadConfig(); await ensureToken(); pollLoop(); }
+boot();

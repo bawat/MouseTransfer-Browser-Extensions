@@ -11,15 +11,22 @@ loopback bridge. You never touch Go or the network between machines.
 
 ## Folder layout
 
-- `chrome/` — Chrome / Edge / Brave / any Chromium browser (MV3).
-- _your browser here_ — e.g. `firefox/`, `safari/`. Open a PR.
+- `chrome/` — Chromium (MV3): Chrome, Edge, Brave, Opera, Vivaldi, Yandex, Samsung, …
+- `firefox/` — Gecko (MV3): Firefox and forks.
+- `safari/` — WebKit: Safari (built via Xcode — see `safari/README.md`).
+- See [BROWSERS.md](BROWSERS.md) for the full per-browser → build → store mapping.
+
+A new engine is a JS-only PR. The JS is identical across builds (a one-line shim at the top
+of `background.js` points `chrome.*` at the promise-based `browser.*` on Firefox/Safari);
+only the manifest and packaging differ.
 
 ## The loopback bridge
 
-Merged listens on `http://127.0.0.1:24812` (loopback only) and authenticates every
-request with a per-install token (the user pastes the endpoint + token into the
-extension's options; Merged logs both on startup and stores the token in
-`browserlink-token` in its config folder).
+Merged listens on `http://127.0.0.1:24812` (loopback only). The extension fetches its
+per-install token automatically from `POST /hello` (it sends a fixed `X-Teleport-Client:
+merged-tab-teleporter` header, which a web page can't send — the CORS preflight is refused —
+so only an extension with `127.0.0.1` host access can get the token). No manual paste; the
+endpoint/token can still be overridden in the extension's options.
 
 | Method & path | Purpose |
 |---|---|
