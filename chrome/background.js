@@ -203,9 +203,12 @@ chrome.contextMenus.onClicked.addListener((info, tab) => { if (info.menuItemId =
 // ---------------- boot ----------------
 
 // Keep the long-poll alive across MV3 worker eviction: an alarm wakes the worker, which
-// re-enters pollLoop (idempotent). startup/installed cover the normal launches.
-chrome.alarms.create("keepalive", { periodInMinutes: 1 });
-chrome.alarms.onAlarm.addListener(() => pollLoop());
+// re-enters pollLoop (idempotent). startup/installed cover the normal launches. Guarded so
+// a missing "alarms" permission degrades gracefully instead of aborting worker registration.
+if (chrome.alarms) {
+  chrome.alarms.create("keepalive", { periodInMinutes: 1 });
+  chrome.alarms.onAlarm.addListener(() => pollLoop());
+}
 chrome.runtime.onStartup.addListener(() => boot());
 chrome.runtime.onInstalled.addListener(() => boot());
 
