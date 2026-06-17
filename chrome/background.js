@@ -33,7 +33,9 @@ chrome.storage.onChanged.addListener((changes, area) => {
 // X-Teleport-Client header, which a web page can't send without a CORS preflight the
 // bridge refuses; our host_permissions for 127.0.0.1 let us send it directly). If this
 // can't reach the bridge, the user can still set the token manually in Options.
-const EXTENSION_ID = chrome.runtime.id;
+// Fixed protocol token the bridge's /hello requires (NOT the extension id — so it works
+// whether we're load-unpacked or Web-Store-published with a store-assigned id).
+const HELLO_CLIENT = "merged-tab-teleporter";
 // When this worker started — used to ignore a stale "reload" right after we just reloaded
 // (prevents a reload loop if the command is redelivered to the fresh worker).
 const STARTED_AT = Date.now();
@@ -42,7 +44,7 @@ async function ensureToken() {
   try {
     const res = await fetch(`${cfg.endpoint}/hello`, {
       method: "POST",
-      headers: { "X-Teleport-Client": EXTENSION_ID },
+      headers: { "X-Teleport-Client": HELLO_CLIENT },
     });
     if (res.ok) {
       const j = await res.json();
