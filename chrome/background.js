@@ -279,17 +279,31 @@ chrome.runtime.onInstalled.addListener(() => {
 });
 chrome.contextMenus.onClicked.addListener((info, tab) => { if (info.menuItemId === "teleport-tab") teleportTab(tab); });
 
+// ---------------- keep-alive ----------------
+//
+// The whole feature depends on the service worker continuously polling /events so a pushed
+// command (capture-window) is received instantly. But MV3 suspends the worker after ~30s
+// idle — even with a pending fetch — which stalled pushes by ~30s (commands piled up in the
+// bridge until the worker woke). Two layers keep it alive:
+//   1) a chrome.* API call every 20s resets the 30s idle timer, so the worker never sleeps;
+//   2) an alarm (coarse, survives an actual eviction) re-enters pollLoop as a backstop.
+let keepAliveTimer = null;
+function startKeepAlive() {
+  if (keepAliveTimer) return;
+  keepAliveTimer = setInterval(() => {
+    // Any extension API call resets the suspension timer; getPlatformInfo is a cheap no-op.
+    chrome.runtime.getPlatformInfo(() => void chrome.runtime.lastError);
+  }, 20000);
+}
+
 // ---------------- boot ----------------
 
-// Keep the long-poll alive across MV3 worker eviction: an alarm wakes the worker, which
-// re-enters pollLoop (idempotent). startup/installed cover the normal launches. Guarded so
-// a missing "alarms" permission degrades gracefully instead of aborting worker registration.
 if (chrome.alarms) {
-  chrome.alarms.create("keepalive", { periodInMinutes: 1 });
-  chrome.alarms.onAlarm.addListener(() => pollLoop());
+  chrome.alarms.create("keepalive", { periodInMinutes: 0.5 }); // backstop if the worker ever dies
+  chrome.alarms.onAlarm.addListener(() => { startKeepAlive(); pollLoop(); });
 }
 chrome.runtime.onStartup.addListener(() => boot());
 chrome.runtime.onInstalled.addListener(() => boot());
 
-async function boot() { await loadConfig(); await ensureToken(); pollLoop(); }
+async function boot() { startKeepAlive(); await loadConfig(); await ensureToken(); pollLoop(); }
 boot();
