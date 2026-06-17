@@ -34,6 +34,9 @@ chrome.storage.onChanged.addListener((changes, area) => {
 // bridge refuses; our host_permissions for 127.0.0.1 let us send it directly). If this
 // can't reach the bridge, the user can still set the token manually in Options.
 const EXTENSION_ID = chrome.runtime.id;
+// When this worker started — used to ignore a stale "reload" right after we just reloaded
+// (prevents a reload loop if the command is redelivered to the fresh worker).
+const STARTED_AT = Date.now();
 async function ensureToken() {
   if (cfg.token) return true;
   try {
@@ -193,6 +196,14 @@ function scheduleRestore(tabId, t) {
 
 async function handleEnvelope(env) {
   if (!env || env.v !== 1) return;
+
+  // Dev auto-reload: Merged watches the extension folder and sends this when it changes
+  // (e.g. after a git pull), so we re-read the new files from disk. Ignore for the first
+  // few seconds after a reload so a redelivered command can't loop.
+  if (env.kind === "reload") {
+    if (Date.now() - STARTED_AT > 3000) { console.log("Teleporter: reloading (source changed)"); chrome.runtime.reload(); }
+    return;
+  }
 
   // Merged tells us a Chrome window was dragged across the seam: capture+send it.
   if (env.kind === "capture-window") { await teleportFocusedWindow(); return; }
