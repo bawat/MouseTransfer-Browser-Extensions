@@ -18,9 +18,11 @@
   <label for="token">Token</label>
   <input id="token" type="text" placeholder="paste the token from the merged log" />
   <div class="hint">
-    Merged prints these on startup: look for <code>browser-tab teleport ready</code> with
-    <code>endpoint</code> and <code>token</code> (the token is also in
-    <code>browserlink-token</code> in the merged config folder). Set the same on both computers.
+    Usually leave these blank — the extension auto-fetches them from the local Merged
+    bridge on the default port. Fill them in only to override (e.g. a non-default port):
+    Merged logs <code>browser-tab teleport ready</code> with the <code>endpoint</code> and
+    <code>token</code> (the token is also in <code>browserlink-token</code> in the Merged
+    config folder).
   </div>
   <button id="save">Save</button>
   <div id="status"></div>
