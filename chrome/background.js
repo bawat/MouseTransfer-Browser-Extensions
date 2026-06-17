@@ -161,18 +161,20 @@ async function handleEnvelope(env) {
     const t = (env.tabs && env.tabs[0]) || null;
     if (!t || !t.url) return;
     const newTab = await chrome.tabs.create({ url: t.url, active: true });
-    // Restore page state once the tab finishes loading, then ack so the source closes its tab.
-    const onUpdated = (tabId, info) => {
-      if (tabId !== newTab.id || info.status !== "complete") return;
-      chrome.tabs.onUpdated.removeListener(onUpdated);
-      chrome.scripting.executeScript({ target: { tabId: newTab.id }, func: restorePageState, args: [{ scrollX: t.scrollX || 0, scrollY: t.scrollY || 0, videoTime: t.videoTime || 0 }] })
-        .catch(() => {})
-        .finally(() => sendEnvelope({ v: 1, kind: "ack", moveId: env.moveId }));
-    };
-    chrome.tabs.onUpdated.addListener(onUpdated);
-    // Safety: ack after 8s even if the page never reports "complete", so the source tab
-    // is still closed (the move succeeded; only the late restore was best-effort).
-    setTimeout(() => { chrome.tabs.onUpdated.removeListener(onUpdated); sendEnvelope({ v: 1, kind: "ack", moveId: env.moveId }); }, 8000);
+    // Ack IMMEDIATELY: the tab exists, so the move has succeeded — the source should close
+    // its tab now rather than wait for the page to load (that wait was the ~5s lag). The
+    // scroll/video restore below runs independently once the page reports "complete".
+    sendEnvelope({ v: 1, kind: "ack", moveId: env.moveId });
+
+    if (t.scrollX || t.scrollY || t.videoTime) {
+      const onUpdated = (tabId, info) => {
+        if (tabId !== newTab.id || info.status !== "complete") return;
+        chrome.tabs.onUpdated.removeListener(onUpdated);
+        chrome.scripting.executeScript({ target: { tabId: newTab.id }, func: restorePageState, args: [{ scrollX: t.scrollX || 0, scrollY: t.scrollY || 0, videoTime: t.videoTime || 0 }] }).catch(() => {});
+      };
+      chrome.tabs.onUpdated.addListener(onUpdated);
+      setTimeout(() => chrome.tabs.onUpdated.removeListener(onUpdated), 20000); // stop listening eventually
+    }
     return;
   }
 
