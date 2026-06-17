@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <style>
+    body { font-family: system-ui, sans-serif; width: 340px; padding: 14px; }
+    label { display: block; margin: 10px 0 4px; font-weight: 600; }
+    input { width: 100%; box-sizing: border-box; padding: 6px; }
+    .hint { color: #666; font-size: 12px; margin-top: 6px; }
+    #status { color: #0a7d2c; font-size: 12px; margin-top: 10px; min-height: 14px; }
+    button { margin-top: 12px; padding: 6px 14px; }
+  </style>
+</head>
+<body>
+  <h3 style="margin:0">Tab Teleporter</h3>
+  <label for="endpoint">Bridge endpoint</label>
+  <input id="endpoint" type="text" placeholder="http://127.0.0.1:24812" />
+  <label for="token">Token</label>
+  <input id="token" type="text" placeholder="paste the token from the merged log" />
+  <div class="hint">
+    Merged prints these on startup: look for <code>browser-tab teleport ready</code> with
+    <code>endpoint</code> and <code>token</code> (the token is also in
+    <code>browserlink-token</code> in the merged config folder). Set the same on both computers.
+  </div>
+  <button id="save">Save</button>
+  <div id="status"></div>
+  <script src="options.js"></script>
+</body>
+</html>
