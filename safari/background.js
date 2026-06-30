@@ -551,8 +551,17 @@ chrome.windows.onRemoved.addListener((windowId) => { onWindowClosed(windowId); }
 // empty (the close event woke THIS worker, so boot()/initWinTabs hasn't repopulated them yet).
 async function onWindowClosed(windowId) {
   if (suppressCarryback.delete(windowId)) return;   // a teleport-away close — skip
-  let role = PROFILE_ROLE;
-  let m = winTabs.get(windowId);
+  // FAST PATH: in-memory state present (worker alive). Closing the teleport browser's LAST window makes
+  // Chrome EXIT, killing any in-flight async work — so send SYNCHRONOUSLY here, before any await, via
+  // sendCarryback (navigator.sendBeacon, which is designed to survive a context teardown).
+  if (PROFILE_ROLE === "teleport") {
+    const m = winTabs.get(windowId);
+    if (m && m.size) { sendCarryback(Array.from(m.values()), windowId); winTabs.delete(windowId); persistWinTabs(); return; }
+  }
+  // SLOW PATH: a resurrected worker (the close event woke us) — recover role + tabs from storage.session.
+  // Best-effort: the awaits may not finish if the browser is also exiting (the keep-alive normally keeps
+  // the worker alive so the fast path runs instead).
+  let role = PROFILE_ROLE, m = winTabs.get(windowId);
   if (!role || !m) {
     try {
       const s = await chrome.storage.session.get(["mtRole", "mtWinTabs"]);
@@ -562,8 +571,18 @@ async function onWindowClosed(windowId) {
   }
   winTabs.delete(windowId); persistWinTabs();
   if (role !== "teleport" || !m || m.size === 0) { dbg("carryback: skipped window " + windowId + " (role=" + role + " tabs=" + (m ? m.size : 0) + ")"); return; }
-  const tabs = Array.from(m.values());
-  try { await fetch(q("/carryback"), { method: "POST", body: JSON.stringify({ tabs }) }); dbg("carryback: queued closed window " + windowId + " (" + tabs.length + " tabs)"); } catch (e) {}
+  sendCarryback(Array.from(m.values()), windowId);
+}
+
+// sendCarryback POSTs a closed window's tabs to the wrapper so it survives the browser/worker teardown
+// that closing the last window triggers: navigator.sendBeacon queues the request in the network stack and
+// is delivered even as the context dies (a plain fetch is cut off). keepalive-fetch is the fallback.
+function sendCarryback(tabs, windowId) {
+  const url = q("/carryback"), body = JSON.stringify({ tabs });
+  let ok = false;
+  try { ok = navigator.sendBeacon(url, body); } catch (e) {}
+  if (!ok) { try { fetch(url, { method: "POST", body, keepalive: true }); } catch (e) {} }
+  dbg("carryback: queued closed window " + windowId + " (" + tabs.length + " tabs, beacon=" + ok + ")");
 }
 
 async function findCarrybackFolder() {
