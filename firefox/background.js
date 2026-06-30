@@ -201,6 +201,49 @@ function scheduleRestore(tabId, t) {
   setTimeout(() => chrome.tabs.onUpdated.removeListener(onUpdated), 20000); // stop listening eventually
 }
 
+// reuseBlankWindow returns the lone blank startup window to reuse for a whole-window teleport — so a
+// browser MouseTransfer just launched for a closed-browser teleport doesn't end up with a blank window
+// AND the teleported one — or null. Deliberately conservative: ONLY a single normal window with a
+// single blank / new-tab tab, so an already-open browser with real windows is never hijacked.
+async function reuseBlankWindow() {
+  try {
+    const wins = await chrome.windows.getAll({ populate: true, windowTypes: ["normal"] });
+    if (!wins || wins.length !== 1) return null;
+    const w = wins[0];
+    if (!w.tabs || w.tabs.length !== 1) return null;
+    const u = ((w.tabs[0].url || w.tabs[0].pendingUrl || "") + "").toLowerCase();
+    if (u === "" || u === "about:blank" || u.startsWith("chrome://newtab") || u.startsWith("chrome://new-tab-page")) {
+      return w;
+    }
+  } catch (e) { /* fall through to creating a fresh window */ }
+  return null;
+}
+
+// wasColdLaunch asks the bridge whether MouseTransfer just launched this browser for the current
+// teleport (browser was closed). One-shot + TTL on the bridge side. A reliable signal for whether to
+// reuse the lone blank startup window — false when the browser was already open. Defaults to false
+// (create a fresh window) if the bridge can't be reached.
+async function wasColdLaunch() {
+  try {
+    const res = await fetch(q("/coldlaunch"));
+    if (res.ok) { const j = await res.json(); return !!(j && j.cold); }
+  } catch (e) { /* bridge unreachable — treat as not a cold launch */ }
+  return false;
+}
+
+// reportTeleportWindow tells the wrapper the bounds of the window we just created/reused for a
+// whole-window teleport, so its ride grabs THIS window — not a restored-session or chrome://extensions
+// window that also opened on a cold launch. Best-effort.
+async function reportTeleportWindow(winId) {
+  try {
+    const w = await chrome.windows.get(winId);
+    if (w && typeof w.left === "number") {
+      fetch(q("/teleport-window") + "&left=" + Math.round(w.left) + "&top=" + Math.round(w.top) +
+        "&width=" + Math.round(w.width) + "&height=" + Math.round(w.height)).catch(() => {});
+    }
+  } catch (e) { /* best-effort */ }
+}
+
 async function handleEnvelope(env) {
   if (!env || env.v !== 1) return;
 
@@ -220,10 +263,28 @@ async function handleEnvelope(env) {
     if (!tabs.length) return;
 
     if (env.asWindow) {
-      // Whole-window teleport: open a new window with the first tab, add the rest, then
-      // re-activate whichever was active on the source.
-      const win = await chrome.windows.create({ url: tabs[0].url, focused: true });
-      const firstId = win.tabs && win.tabs[0] && win.tabs[0].id;
+      // Whole-window teleport. If MouseTransfer just LAUNCHED the browser for this teleport (it was
+      // closed on this machine), there's a lone blank startup window — REUSE it instead of creating a
+      // second one, otherwise the user ends up with a blank window AND the teleported window. Only when
+      // it's the single window with a single blank/new-tab tab, so an already-open browser is never
+      // hijacked (then we create a fresh window as before).
+      // Reuse the lone blank window ONLY when MouseTransfer just COLD-LAUNCHED the browser for this
+      // teleport (it was closed) — asked authoritatively via /coldlaunch, NOT guessed from how long ago
+      // the worker started (that also fires on an extension reload / worker resurrection, which made
+      // warm teleports wrongly reuse a pre-existing window → no new window for the ride → "didn't
+      // transfer"). When the browser was already OPEN, /coldlaunch is false → ALWAYS create a NEW window
+      // so the wrapper's ride can grab it and follow the cursor to the drop point.
+      const reuse = (await wasColdLaunch()) ? await reuseBlankWindow() : null;
+      let win, firstId;
+      if (reuse) {
+        win = reuse;
+        firstId = reuse.tabs[0].id;
+        await chrome.tabs.update(firstId, { url: tabs[0].url, active: true });
+        try { await chrome.windows.update(win.id, { focused: true }); } catch (e) {}
+      } else {
+        win = await chrome.windows.create({ url: tabs[0].url, focused: true });
+        firstId = win.tabs && win.tabs[0] && win.tabs[0].id;
+      }
       scheduleRestore(firstId, tabs[0]);
       let activeId = tabs[0].active ? firstId : null;
       for (let i = 1; i < tabs.length; i++) {
@@ -232,6 +293,7 @@ async function handleEnvelope(env) {
         if (tabs[i].active) activeId = nt.id;
       }
       if (activeId) chrome.tabs.update(activeId, { active: true }).catch(() => {});
+      reportTeleportWindow(win.id); // tell the wrapper WHICH window to ride (so it doesn't grab a restored one)
     } else {
       const newTab = await chrome.tabs.create({ url: tabs[0].url, active: true });
       scheduleRestore(newTab.id, tabs[0]);
@@ -289,18 +351,47 @@ chrome.contextMenus.onClicked.addListener((info, tab) => { if (info.menuItemId =
 // ---------------- keep-alive ----------------
 //
 // The whole feature depends on the service worker continuously polling /events so a pushed
-// command (capture-window) is received instantly. But MV3 suspends the worker after ~30s
-// idle — even with a pending fetch — which stalled pushes by ~30s (commands piled up in the
-// bridge until the worker woke). Two layers keep it alive:
-//   1) a chrome.* API call every 20s resets the 30s idle timer, so the worker never sleeps;
-//   2) an alarm (coarse, survives an actual eviction) re-enters pollLoop as a backstop.
+// command (capture-window) and incoming opens are received instantly. But MV3 suspends the
+// worker after ~30s idle — even with a pending fetch — which stalls delivery until the worker
+// wakes (commands/opens pile up in the bridge). On a fast machine a periodic API-ping kept it
+// alive; on a SLOW/OLD box (the Win8 laptop runs at most Chrome 109, MV3-transition era) a
+// setInterval-based ping is NOT reliable — a setInterval is silently lost the moment the worker
+// is suspended, so the worker died and only the 30s alarm resurrected it, leaving a dead window
+// of up to ~30s where teleports "took ages". Three layers, strongest first:
+//   1) a PORT LIFELINE — an open runtime port continuously holds the worker alive (a connection,
+//      not a timer that can be lost). This is Google's documented MV3-transition workaround and
+//      is the reliable one on Chrome 109. Chrome force-disconnects ports at ~5 min, so we
+//      reconnect well before that for a fresh lease.
+//   2) an AWAITED getPlatformInfo loop (every 15s) as a secondary timer-based reset.
+//   3) a coarse alarm (0.5 min) that survives an actual eviction and re-enters pollLoop.
+let lifelinePort = null;
+function startLifeline() {
+  if (lifelinePort) return;
+  try {
+    lifelinePort = chrome.runtime.connect({ name: "keepalive" });
+    lifelinePort.onDisconnect.addListener(() => {
+      void chrome.runtime.lastError; // swallow "port closed" on reconnect
+      lifelinePort = null;
+      startLifeline(); // immediately re-establish for the next ~5-min lease
+    });
+  } catch (e) { lifelinePort = null; }
+}
+// The other end of the lifeline lives in THIS same worker (a self-connect): holding the port
+// open keeps the worker alive. Drop it just before Chrome's ~5-min hard port limit so the
+// onDisconnect above reconnects (a fresh lease) rather than Chrome killing the worker.
+chrome.runtime.onConnect.addListener((port) => {
+  if (port.name !== "keepalive") return;
+  setTimeout(() => { try { port.disconnect(); } catch (e) {} }, 250000); // ~4m10s < 5m cap
+});
+
 let keepAliveTimer = null;
 function startKeepAlive() {
+  startLifeline();
   if (keepAliveTimer) return;
-  keepAliveTimer = setInterval(() => {
-    // Any extension API call resets the suspension timer; getPlatformInfo is a cheap no-op.
-    chrome.runtime.getPlatformInfo(() => void chrome.runtime.lastError);
-  }, 20000);
+  // AWAITED (not fire-and-forget): the response coming back is what resets the idle timer.
+  keepAliveTimer = setInterval(async () => {
+    try { await chrome.runtime.getPlatformInfo(); } catch (e) {}
+  }, 15000);
 }
 
 // ---------------- boot ----------------
