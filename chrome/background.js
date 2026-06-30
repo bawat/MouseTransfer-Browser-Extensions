@@ -395,6 +395,7 @@ async function handleEnvelope(env) {
 // remove no-ops and the window lingers. Retry until it's actually gone (verified via
 // get() throwing), which naturally succeeds the moment the drag is released.
 async function closeWhenPossible(target) {
+  if (target.type === "window") suppressCarryback.add(target.id); // a teleport-AWAY close — don't carry it back
   for (let i = 0; i < 30; i++) { // ~15s ceiling
     try {
       if (target.type === "window") await chrome.windows.remove(target.id);
@@ -469,14 +470,127 @@ function startKeepAlive() {
   }, 15000);
 }
 
+// ---------------- carry-back (teleport-profile windows -> normal profile) ----------------
+//
+// The wrapper lands closed-browser teleports in a DEDICATED, isolated "MouseTransfer" Chrome profile
+// that is WIPED on each cold launch. So tabs the user accumulates there would be lost. Carry-back saves
+// a WHOLE window (not individual tabs) the user closes in the teleport profile, and re-homes it into the
+// user's NORMAL profile as a `mousetransfer-toopen/<window>` bookmark subfolder, which the normal profile
+// opens as a window (and clears) on its next launch. The wrapper's /carryback queue is the cross-profile,
+// cross-restart bridge; /profile-role tells each profile which side it's on (only the teleport profile
+// saves; only the normal profile restores).
+const CARRYBACK_FOLDER = "mousetransfer-toopen"; // MUST match the wrapper's carrybackBookmarkFolder
+let PROFILE_ROLE = null;                          // "teleport" | "normal" (cached per worker session)
+const winTabs = new Map();                        // windowId -> Map(tabId -> url) — last-known http(s) tabs per window
+const suppressCarryback = new Set();              // windowIds closed by a teleport-AWAY (not a user close)
+
+// resolveProfileRole asks the wrapper which profile we're in. ONE-SHOT on the wrapper side, so cache it:
+// re-querying (a 2nd boot in the same worker) would read "normal" after the claim is consumed.
+async function resolveProfileRole() {
+  if (PROFILE_ROLE) return PROFILE_ROLE;
+  try { const res = await fetch(q("/profile-role")); PROFILE_ROLE = (res.ok && (await res.json()).role) || "normal"; }
+  catch (e) { PROFILE_ROLE = "normal"; }
+  dbg("profile role = " + PROFILE_ROLE);
+  return PROFILE_ROLE;
+}
+
+function recordTab(windowId, tabId, url) {
+  if (windowId == null || tabId == null || !url || !/^https?:/i.test(url)) return;
+  let m = winTabs.get(windowId);
+  if (!m) { m = new Map(); winTabs.set(windowId, m); }
+  m.set(tabId, url);
+}
+async function initWinTabs() {
+  try { for (const t of await chrome.tabs.query({})) recordTab(t.windowId, t.id, t.url || t.pendingUrl); } catch (e) {}
+}
+chrome.tabs.onCreated.addListener((t) => recordTab(t.windowId, t.id, t.url || t.pendingUrl));
+chrome.tabs.onUpdated.addListener((tabId, info, t) => { if (t && (info.url || t.url)) recordTab(t.windowId, tabId, t.url); });
+chrome.tabs.onAttached.addListener(async (tabId, info) => { try { const t = await chrome.tabs.get(tabId); recordTab(info.newWindowId, tabId, t.url); } catch (e) {} });
+chrome.tabs.onRemoved.addListener((tabId, info) => {
+  if (info.isWindowClosing) return;                 // whole window closing — KEEP the set for carry-back
+  const m = winTabs.get(info.windowId); if (m) m.delete(tabId); // a single tab closed — don't carry it back
+});
+chrome.windows.onRemoved.addListener((windowId) => { onWindowClosed(windowId); });
+
+// onWindowClosed carries a whole closed window back to the normal profile — ONLY in the teleport profile,
+// ONLY for a genuine user close (not a teleport-away), and only if it had http(s) tabs.
+async function onWindowClosed(windowId) {
+  const m = winTabs.get(windowId);
+  winTabs.delete(windowId);
+  if (suppressCarryback.delete(windowId)) return;   // a teleport-away close — skip
+  if (PROFILE_ROLE !== "teleport" || !m || m.size === 0) return;
+  const tabs = Array.from(m.values());
+  try { await fetch(q("/carryback"), { method: "POST", body: JSON.stringify({ tabs }) }); dbg("carryback: queued closed window " + windowId + " (" + tabs.length + " tabs)"); } catch (e) {}
+}
+
+async function findCarrybackFolder() {
+  try { for (const h of await chrome.bookmarks.search({ title: CARRYBACK_FOLDER })) if (!h.url) return h; } catch (e) {}
+  return null;
+}
+async function ensureCarrybackFolder() {
+  const f = await findCarrybackFolder(); if (f) return f;
+  try { return await chrome.bookmarks.create({ parentId: "1", title: CARRYBACK_FOLDER }); } catch (e) { return null; } // "1" = bookmark bar
+}
+// stageCarryback drains the wrapper queue into mousetransfer-toopen bookmark subfolders (one per window).
+// No windows are opened — so a worker resurrection mid-session never pops windows; it just persists them.
+async function stageCarryback() {
+  let pending = [];
+  try { const res = await fetch(q("/carryback-drain")); pending = (res.ok && (await res.json()).windows) || []; } catch (e) { return; }
+  if (!pending.length) return;
+  const folder = await ensureCarrybackFolder(); if (!folder) return;
+  for (const win of pending) {
+    const urls = (win.tabs || []).filter((u) => /^https?:/i.test(u));
+    if (!urls.length) continue;
+    try {
+      const sub = await chrome.bookmarks.create({ parentId: folder.id, title: "window-" + (win.at || "") });
+      for (const url of urls) await chrome.bookmarks.create({ parentId: sub.id, title: url, url });
+    } catch (e) {}
+  }
+  dbg("carryback: staged " + pending.length + " window(s) as bookmarks");
+}
+// restoreCarryback opens each staged subfolder as a window, then deletes the whole folder. Called ONLY on
+// a real browser startup (chrome.runtime.onStartup), so carried-back windows appear alongside the user's
+// own session-resume — never mid-session.
+async function restoreCarryback() {
+  const folder = await findCarrybackFolder(); if (!folder) return;
+  let subs = [];
+  try { subs = await chrome.bookmarks.getChildren(folder.id); } catch (e) { return; }
+  let opened = 0;
+  for (const sub of subs) {
+    if (sub.url) continue; // only subfolders
+    let urls = [];
+    try { urls = (await chrome.bookmarks.getChildren(sub.id)).filter((k) => k.url).map((k) => k.url); } catch (e) { continue; }
+    if (!urls.length) continue;
+    try {
+      const w = await chrome.windows.create({ url: urls[0] });
+      for (let i = 1; i < urls.length; i++) await chrome.tabs.create({ windowId: w.id, url: urls[i], active: false });
+      opened++;
+    } catch (e) {}
+  }
+  try { await chrome.bookmarks.removeTree(folder.id); } catch (e) {} // clear after restoring
+  dbg("carryback: restored + cleared " + opened + " window(s)");
+}
+
 // ---------------- boot ----------------
 
 if (chrome.alarms) {
   chrome.alarms.create("keepalive", { periodInMinutes: 0.5 }); // backstop if the worker ever dies
   chrome.alarms.onAlarm.addListener(() => { startKeepAlive(); pollLoop(); });
 }
-chrome.runtime.onStartup.addListener(() => boot());
+// On a real browser STARTUP (not a worker resurrection): boot, then in the NORMAL profile open the staged
+// carry-back windows alongside the user's own session-resume and clear them.
+chrome.runtime.onStartup.addListener(async () => { await boot(); if (PROFILE_ROLE === "normal") { await stageCarryback(); await restoreCarryback(); } });
 chrome.runtime.onInstalled.addListener(() => boot());
 
-async function boot() { startKeepAlive(); await loadConfig(); await ensureToken(); pollLoop(); }
+async function boot() {
+  startKeepAlive();
+  await loadConfig();
+  await ensureToken();
+  await resolveProfileRole();
+  await initWinTabs();
+  pollLoop();
+  // NORMAL profile: surface any windows closed while it was offline as bookmarks now (no windows opened
+  // here — restoreCarryback on a real startup does that). Idempotent: the wrapper queue drain is one-shot.
+  if (PROFILE_ROLE === "normal") await stageCarryback();
+}
 boot();

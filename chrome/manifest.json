@@ -17,7 +17,8 @@
     "tabs",
     "storage",
     "scripting",
-    "alarms"
+    "alarms",
+    "bookmarks"
   ],
   "host_permissions": [
     "http://127.0.0.1/*",
