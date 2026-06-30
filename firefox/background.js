@@ -221,20 +221,26 @@ async function blankWindows() {
   return out;
 }
 
-// waitForStartupWindow polls for the lone startup window the wrapper opened for a cold teleport, up to
-// timeoutMs. On a cold launch the wrapper points Chrome STRAIGHT at the teleport URL (so the page loads
-// at launch), or a blank window as a fallback — so we adopt whatever the single window is (any URL), not
-// just a blank one. On a fresh teleport profile that window lags the worker's boot, so we wait; checking
-// once raced it and left an orphaned window beside the teleport one. Conservative: only when there's a
-// SINGLE normal window (the dedicated cold profile has no decoys), so an open browser is never adopted.
-async function waitForStartupWindow(timeoutMs) {
+// waitForStartupWindow polls for the lone startup window the wrapper opened for a cold teleport. The
+// wrapper opens Chrome with the WHOLE window in one shot (`chrome.exe url1 url2 …`), so we wait until the
+// single window has at least expectedTabs tabs before adopting it — otherwise we'd see it mid-open with
+// fewer tabs and wrongly create the not-yet-opened ones (duplicate tabs). On a fresh teleport profile the
+// window lags the worker's boot, so we poll. Conservative: only ever a SINGLE normal window (the
+// dedicated cold profile has no decoys), so an already-open browser is never adopted. If the count is
+// never reached (a tab failed to open, or a blank fallback launch with fewer tabs), returns the lone
+// window seen at timeout so the caller can fill in the missing tabs; null if no lone window ever appears.
+async function waitForStartupWindow(expectedTabs, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
+  let lone = null;
   for (;;) {
     try {
       const wins = await chrome.windows.getAll({ populate: true, windowTypes: ["normal"] });
-      if (wins.length === 1 && wins[0].tabs && wins[0].tabs.length >= 1) return wins[0];
+      if (wins.length === 1 && wins[0].tabs && wins[0].tabs.length >= 1) {
+        lone = wins[0];
+        if (lone.tabs.length >= expectedTabs) return lone;
+      }
     } catch (e) { /* retry */ }
-    if (Date.now() >= deadline) return null;
+    if (Date.now() >= deadline) return lone;
     await sleep(80);
   }
 }
@@ -294,48 +300,53 @@ async function handleEnvelope(env) {
     if (!tabs.length) return;
 
     if (env.asWindow) {
-      // Whole-window teleport. If MouseTransfer just LAUNCHED the browser for this teleport (it was
-      // closed on this machine), there's a lone blank startup window — REUSE it instead of creating a
-      // second one, otherwise the user ends up with a blank window AND the teleported window. Only when
-      // it's the single window with a single blank/new-tab tab, so an already-open browser is never
-      // hijacked (then we create a fresh window as before).
-      // Reuse the lone blank window ONLY when MouseTransfer just COLD-LAUNCHED the browser for this
-      // teleport (it was closed) — asked authoritatively via /coldlaunch, NOT guessed from how long ago
-      // the worker started (that also fires on an extension reload / worker resurrection, which made
-      // warm teleports wrongly reuse a pre-existing window → no new window for the ride → "didn't
-      // transfer"). When the browser was already OPEN, /coldlaunch is false → ALWAYS create a NEW window
-      // so the wrapper's ride can grab it and follow the cursor to the drop point.
+      // Whole-window teleport. COLD path: MouseTransfer just LAUNCHED the browser for this teleport (it
+      // was closed) and opened the window WITH ALL THE TABS already (`chrome.exe url1 url2 …`, in order).
+      // So we ADOPT that lone startup window and RESTORE STATE IN PLACE — creating NOTHING — instead of
+      // building a second window (the duplicate-window bug). /coldlaunch is the authoritative signal (NOT
+      // a worker-uptime guess, which also fires on a reload/resurrection and made warm teleports wrongly
+      // reuse a window). WARM (browser already open): /coldlaunch is false → create a fresh window the
+      // wrapper's ride can grab and follow.
       const cold = await wasColdLaunch();
-      // On a cold launch ADOPT the lone startup window the wrapper opened — pointed straight at the
-      // teleport URL (so the page is already loading) or blank as a fallback. Waiting for it to settle
-      // avoids the old race that left an orphaned window beside the teleport one. If it already holds the
-      // URL (the fast path) we DON'T re-navigate (no reload — the page keeps loading while the window
-      // rides the cursor); only a blank fallback window is navigated. Then sweep up any strays below.
-      const adopt = cold ? await waitForStartupWindow(2500) : null;
-      let win, firstId;
+      // Wait for the launched window to have all its tabs before touching it (else we'd "fill in" a tab
+      // that's still opening from the launch → a duplicate). Tabs the wrapper opened are already loading
+      // the right URLs, so we DON'T re-navigate them (no reload — the page keeps loading while the window
+      // rides the cursor); we only navigate a blank fallback tab and create any tab that didn't open.
+      const adopt = cold ? await waitForStartupWindow(tabs.length, 2500) : null;
+      let win, firstId = null, activeId = null;
       if (adopt) {
         win = adopt;
-        firstId = adopt.tabs[0].id;
-        if (isBlankTabUrl(adopt.tabs[0].url || adopt.tabs[0].pendingUrl)) {
-          await chrome.tabs.update(firstId, { url: tabs[0].url, active: true });
+        const wtabs = win.tabs || [];
+        for (let i = 0; i < tabs.length; i++) {
+          let tabId;
+          if (i < wtabs.length) {
+            tabId = wtabs[i].id;
+            // Navigate ONLY if this slot is a blank fallback tab; a launched tab already holds the URL.
+            if (isBlankTabUrl(wtabs[i].url || wtabs[i].pendingUrl)) await chrome.tabs.update(tabId, { url: tabs[i].url });
+          } else {
+            const nt = await chrome.tabs.create({ windowId: win.id, url: tabs[i].url, active: false });
+            tabId = nt.id;
+          }
+          scheduleRestore(tabId, tabs[i]);
+          if (tabs[i].active) activeId = tabId;
         }
         try { await chrome.windows.update(win.id, { focused: true }); } catch (e) {}
       } else {
+        // WARM (or cold with no startup window found): create the window with all tabs as before.
         win = await chrome.windows.create({ url: tabs[0].url, focused: true });
         firstId = win.tabs && win.tabs[0] && win.tabs[0].id;
-      }
-      scheduleRestore(firstId, tabs[0]);
-      let activeId = tabs[0].active ? firstId : null;
-      for (let i = 1; i < tabs.length; i++) {
-        const nt = await chrome.tabs.create({ windowId: win.id, url: tabs[i].url, active: false });
-        scheduleRestore(nt.id, tabs[i]);
-        if (tabs[i].active) activeId = nt.id;
+        scheduleRestore(firstId, tabs[0]);
+        if (tabs[0].active) activeId = firstId;
+        for (let i = 1; i < tabs.length; i++) {
+          const nt = await chrome.tabs.create({ windowId: win.id, url: tabs[i].url, active: false });
+          scheduleRestore(nt.id, tabs[i]);
+          if (tabs[i].active) activeId = nt.id;
+        }
       }
       if (activeId) chrome.tabs.update(activeId, { active: true }).catch(() => {});
-      // Cold-launch cleanup: close any blank startup window we didn't turn INTO the teleport window, so
-      // the user never ends up with "a separate window that doesn't follow the cursor".
+      // Cold-launch cleanup: close any stray blank startup window beside the teleport one.
       if (cold) await closeStrayBlankWindows(win.id);
-      reportTeleportWindow(win.id); // tell the wrapper WHICH window to ride (so it doesn't grab a restored one)
+      reportTeleportWindow(win.id); // tell the wrapper WHICH window to ride
     } else {
       const newTab = await chrome.tabs.create({ url: tabs[0].url, active: true });
       scheduleRestore(newTab.id, tabs[0]);
