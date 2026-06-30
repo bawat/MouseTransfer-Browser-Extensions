@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Tab Teleporter (Merged)",
-  "version": "2.1",
+  "version": "2.2",
   "description": "Teleport the current tab to the other computer (via the local Merged bridge), preserving YouTube/video time and scroll position.",
   "action": {
     "default_title": "Teleport this tab to the other computer"
@@ -33,7 +33,9 @@
   },
   "commands": {
     "teleport-tab": {
-      "suggested_key": { "default": "Ctrl+Shift+Y" },
+      "suggested_key": {
+        "default": "Ctrl+Shift+Y"
+      },
       "description": "Teleport the active tab to the other computer"
     }
   }
