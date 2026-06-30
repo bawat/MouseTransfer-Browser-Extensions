@@ -216,26 +216,38 @@ async function blankWindows() {
   return out;
 }
 
-// waitForStartupWindow polls for the lone startup window the wrapper opened for a cold teleport. The
-// wrapper opens Chrome with the WHOLE window in one shot (`chrome.exe url1 url2 …`), so we wait until the
-// single window has at least expectedTabs tabs before adopting it — otherwise we'd see it mid-open with
-// fewer tabs and wrongly create the not-yet-opened ones (duplicate tabs). On a fresh teleport profile the
-// window lags the worker's boot, so we poll. Conservative: only ever a SINGLE normal window (the
-// dedicated cold profile has no decoys), so an already-open browser is never adopted. If the count is
-// never reached (a tab failed to open, or a blank fallback launch with fewer tabs), returns the lone
-// window seen at timeout so the caller can fill in the missing tabs; null if no lone window ever appears.
-async function waitForStartupWindow(expectedTabs, timeoutMs) {
+// findLaunchedWindow locates the window the wrapper opened for a cold teleport — it launches Chrome with
+// the WHOLE window in one shot (`chrome.exe url1 url2 …`). We must NOT require it to be the ONLY window:
+// a fresh teleport profile can pop a stray blank / welcome window alongside it, and requiring "exactly
+// one window" then failed → the extension built a SECOND window (two windows, same tabs). Instead we
+// identify the launched window robustly, ignoring strays, by (in order): (a) a window with >= the
+// expected tab count — unambiguous on a cold launch, where only the launched window holds multiple tabs;
+// (b) a window whose first tab is (loading) the launched first URL; (c) the lone NON-blank window. We
+// wait until it has all its tabs (so a tab still opening from the launch isn't seen as missing and
+// re-created), returning the best match at timeout. Strays are closed by closeStrayBlankWindows after.
+async function findLaunchedWindow(tabs, timeoutMs) {
+  const want = (((tabs[0] && tabs[0].url) || "") + "").split("#")[0];
   const deadline = Date.now() + timeoutMs;
-  let lone = null;
+  let best = null;
   for (;;) {
-    try {
-      const wins = await chrome.windows.getAll({ populate: true, windowTypes: ["normal"] });
-      if (wins.length === 1 && wins[0].tabs && wins[0].tabs.length >= 1) {
-        lone = wins[0];
-        if (lone.tabs.length >= expectedTabs) return lone;
-      }
-    } catch (e) { /* retry */ }
-    if (Date.now() >= deadline) return lone;
+    let wins = [];
+    try { wins = await chrome.windows.getAll({ populate: true, windowTypes: ["normal"] }); } catch (e) {}
+    let match = null;
+    if (tabs.length > 1) match = wins.find((w) => w.tabs && w.tabs.length >= tabs.length);
+    if (!match) match = wins.find((w) => {
+      if (!w.tabs || !w.tabs.length) return false;
+      const u = ((w.tabs[0].url || w.tabs[0].pendingUrl || "") + "").split("#")[0];
+      return u && want && (u === want || u.startsWith(want) || want.startsWith(u));
+    });
+    if (!match) {
+      const nonBlank = wins.filter((w) => w.tabs && !(w.tabs.length === 1 && isBlankTabUrl(w.tabs[0].url || w.tabs[0].pendingUrl)));
+      if (nonBlank.length === 1) match = nonBlank[0];
+    }
+    if (match) {
+      best = match;
+      if (match.tabs.length >= tabs.length) return match; // all launched tabs present
+    }
+    if (Date.now() >= deadline) return best;
     await sleep(80);
   }
 }
@@ -307,7 +319,7 @@ async function handleEnvelope(env) {
       // that's still opening from the launch → a duplicate). Tabs the wrapper opened are already loading
       // the right URLs, so we DON'T re-navigate them (no reload — the page keeps loading while the window
       // rides the cursor); we only navigate a blank fallback tab and create any tab that didn't open.
-      const adopt = cold ? await waitForStartupWindow(tabs.length, 2500) : null;
+      const adopt = cold ? await findLaunchedWindow(tabs, 2500) : null;
       let win, firstId = null, activeId = null;
       if (adopt) {
         win = adopt;
