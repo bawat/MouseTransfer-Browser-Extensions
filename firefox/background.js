@@ -489,12 +489,26 @@ let PROFILE_ROLE = null;                          // "teleport" | "normal" (cach
 const winTabs = new Map();                        // windowId -> Map(tabId -> url) — last-known http(s) tabs per window
 const suppressCarryback = new Set();              // windowIds closed by a teleport-AWAY (not a user close)
 
-// resolveProfileRole asks the wrapper which profile we're in. ONE-SHOT on the wrapper side, so cache it:
-// re-querying (a 2nd boot in the same worker) would read "normal" after the claim is consumed.
+// MV3 service workers are EPHEMERAL — they suspend when idle and a later event (e.g. a window close)
+// resurrects a FRESH worker with empty in-memory state. So PROFILE_ROLE and the per-window tab cache are
+// mirrored to chrome.storage.session (survives suspension, cleared on browser close), and onWindowClosed
+// recovers them from there when the in-memory copies are empty (the close event woke a fresh worker).
+async function persistRole() { try { await chrome.storage.session.set({ mtRole: PROFILE_ROLE }); } catch (e) {} }
+function winTabsToObj() {
+  const o = {};
+  for (const [wid, m] of winTabs) { o[wid] = {}; for (const [tid, url] of m) o[wid][tid] = url; }
+  return o;
+}
+function persistWinTabs() { try { chrome.storage.session.set({ mtWinTabs: winTabsToObj() }); } catch (e) {} }
+
+// resolveProfileRole asks the wrapper which profile we're in. ONE-SHOT on the wrapper side, so cache it
+// (in storage.session too, so a resurrected worker doesn't re-query after the claim is consumed).
 async function resolveProfileRole() {
   if (PROFILE_ROLE) return PROFILE_ROLE;
+  try { const s = await chrome.storage.session.get("mtRole"); if (s && s.mtRole) { PROFILE_ROLE = s.mtRole; return PROFILE_ROLE; } } catch (e) {}
   try { const res = await fetch(q("/profile-role")); PROFILE_ROLE = (res.ok && (await res.json()).role) || "normal"; }
   catch (e) { PROFILE_ROLE = "normal"; }
+  await persistRole();
   dbg("profile role = " + PROFILE_ROLE);
   return PROFILE_ROLE;
 }
@@ -504,8 +518,13 @@ function recordTab(windowId, tabId, url) {
   let m = winTabs.get(windowId);
   if (!m) { m = new Map(); winTabs.set(windowId, m); }
   m.set(tabId, url);
+  persistWinTabs();
 }
 async function initWinTabs() {
+  try { // recover a resurrected worker's cache first (the close event may have woken us)
+    const s = await chrome.storage.session.get("mtWinTabs");
+    if (s && s.mtWinTabs) for (const wid in s.mtWinTabs) { const m = new Map(); for (const tid in s.mtWinTabs[wid]) m.set(tid, s.mtWinTabs[wid][tid]); winTabs.set(Number(wid), m); }
+  } catch (e) {}
   try { for (const t of await chrome.tabs.query({})) recordTab(t.windowId, t.id, t.url || t.pendingUrl); } catch (e) {}
 }
 chrome.tabs.onCreated.addListener((t) => recordTab(t.windowId, t.id, t.url || t.pendingUrl));
@@ -513,17 +532,28 @@ chrome.tabs.onUpdated.addListener((tabId, info, t) => { if (t && (info.url || t.
 chrome.tabs.onAttached.addListener(async (tabId, info) => { try { const t = await chrome.tabs.get(tabId); recordTab(info.newWindowId, tabId, t.url); } catch (e) {} });
 chrome.tabs.onRemoved.addListener((tabId, info) => {
   if (info.isWindowClosing) return;                 // whole window closing — KEEP the set for carry-back
-  const m = winTabs.get(info.windowId); if (m) m.delete(tabId); // a single tab closed — don't carry it back
+  const m = winTabs.get(info.windowId); if (m) { m.delete(tabId); persistWinTabs(); } // single tab closed — don't carry it back
 });
+chrome.runtime.onSuspend.addListener(() => { try { chrome.storage.session.set({ mtWinTabs: winTabsToObj(), mtRole: PROFILE_ROLE }); } catch (e) {} });
 chrome.windows.onRemoved.addListener((windowId) => { onWindowClosed(windowId); });
 
 // onWindowClosed carries a whole closed window back to the normal profile — ONLY in the teleport profile,
-// ONLY for a genuine user close (not a teleport-away), and only if it had http(s) tabs.
+// ONLY for a genuine user close (not a teleport-away), and only if it had http(s) tabs. Robust against a
+// fresh (resurrected) worker: role + tabs are recovered from storage.session when the in-memory copies are
+// empty (the close event woke THIS worker, so boot()/initWinTabs hasn't repopulated them yet).
 async function onWindowClosed(windowId) {
-  const m = winTabs.get(windowId);
-  winTabs.delete(windowId);
   if (suppressCarryback.delete(windowId)) return;   // a teleport-away close — skip
-  if (PROFILE_ROLE !== "teleport" || !m || m.size === 0) return;
+  let role = PROFILE_ROLE;
+  let m = winTabs.get(windowId);
+  if (!role || !m) {
+    try {
+      const s = await chrome.storage.session.get(["mtRole", "mtWinTabs"]);
+      if (!role && s && s.mtRole) role = s.mtRole;
+      if (!m && s && s.mtWinTabs && s.mtWinTabs[windowId]) { m = new Map(); for (const tid in s.mtWinTabs[windowId]) m.set(tid, s.mtWinTabs[windowId][tid]); }
+    } catch (e) {}
+  }
+  winTabs.delete(windowId); persistWinTabs();
+  if (role !== "teleport" || !m || m.size === 0) { dbg("carryback: skipped window " + windowId + " (role=" + role + " tabs=" + (m ? m.size : 0) + ")"); return; }
   const tabs = Array.from(m.values());
   try { await fetch(q("/carryback"), { method: "POST", body: JSON.stringify({ tabs }) }); dbg("carryback: queued closed window " + windowId + " (" + tabs.length + " tabs)"); } catch (e) {}
 }
