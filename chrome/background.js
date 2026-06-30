@@ -288,6 +288,19 @@ async function reportTeleportWindow(winId) {
   } catch (e) { /* best-effort */ }
 }
 
+// dbg surfaces a diagnostic line into the wrapper's btrace log (POST /debug) so we can see the
+// extension's own view of the windows from a remote machine. Best-effort; the wrapper logs it only when
+// its browser-teleport trace toggle is on.
+function dbg(m) { try { fetch(q("/debug"), { method: "POST", body: String(m) }).catch(() => {}); } catch (e) {} }
+
+// winSummary renders the current normal windows + tab counts + first URLs for a dbg line.
+async function winSummary() {
+  try {
+    const ws = await chrome.windows.getAll({ populate: true, windowTypes: ["normal"] });
+    return ws.map((w) => "#" + w.id + "(" + (w.tabs ? w.tabs.length : 0) + "t:" + (((w.tabs && w.tabs[0] && (w.tabs[0].url || w.tabs[0].pendingUrl)) || "") + "").slice(0, 32) + ")").join(", ") || "(none)";
+  } catch (e) { return "(getAll failed: " + e + ")"; }
+}
+
 async function handleEnvelope(env) {
   if (!env || env.v !== 1) return;
 
@@ -315,11 +328,13 @@ async function handleEnvelope(env) {
       // reuse a window). WARM (browser already open): /coldlaunch is false → create a fresh window the
       // wrapper's ride can grab and follow.
       const cold = await wasColdLaunch();
+      dbg("asWindow open: cold=" + cold + " tabs=" + tabs.length + " | windows: " + (await winSummary()));
       // Wait for the launched window to have all its tabs before touching it (else we'd "fill in" a tab
       // that's still opening from the launch → a duplicate). Tabs the wrapper opened are already loading
       // the right URLs, so we DON'T re-navigate them (no reload — the page keeps loading while the window
       // rides the cursor); we only navigate a blank fallback tab and create any tab that didn't open.
       const adopt = cold ? await findLaunchedWindow(tabs, 2500) : null;
+      dbg("adopt=" + (adopt ? ("win#" + adopt.id + " tabs=" + (adopt.tabs ? adopt.tabs.length : 0)) : "NULL -> creating a NEW window") + " | windows now: " + (await winSummary()));
       let win, firstId = null, activeId = null;
       if (adopt) {
         win = adopt;
