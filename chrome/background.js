@@ -216,17 +216,21 @@ async function blankWindows() {
   return out;
 }
 
-// waitForBlankWindow polls for a lone blank startup window to settle, up to timeoutMs. On a fresh
-// teleport profile the startup window lags the extension's boot, so checking ONCE (the old bug) often
-// missed it — the teleport then created a SECOND window and left the blank one orphaned ("a separate
-// window that doesn't follow the cursor"). Waiting makes the reuse deterministic.
-async function waitForBlankWindow(timeoutMs) {
+// waitForStartupWindow polls for the lone startup window the wrapper opened for a cold teleport, up to
+// timeoutMs. On a cold launch the wrapper points Chrome STRAIGHT at the teleport URL (so the page loads
+// at launch), or a blank window as a fallback — so we adopt whatever the single window is (any URL), not
+// just a blank one. On a fresh teleport profile that window lags the worker's boot, so we wait; checking
+// once raced it and left an orphaned window beside the teleport one. Conservative: only when there's a
+// SINGLE normal window (the dedicated cold profile has no decoys), so an open browser is never adopted.
+async function waitForStartupWindow(timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    const blanks = await blankWindows();
-    if (blanks.length) return blanks[0];
+    try {
+      const wins = await chrome.windows.getAll({ populate: true, windowTypes: ["normal"] });
+      if (wins.length === 1 && wins[0].tabs && wins[0].tabs.length >= 1) return wins[0];
+    } catch (e) { /* retry */ }
     if (Date.now() >= deadline) return null;
-    await sleep(100);
+    await sleep(80);
   }
 }
 
@@ -297,15 +301,19 @@ async function handleEnvelope(env) {
       // transfer"). When the browser was already OPEN, /coldlaunch is false → ALWAYS create a NEW window
       // so the wrapper's ride can grab it and follow the cursor to the drop point.
       const cold = await wasColdLaunch();
-      // On a cold launch WAIT for the blank startup window to settle before reusing it — checking once
-      // (the old code) raced the fresh profile's startup and often missed it, leaving an orphaned blank
-      // window beside the teleport one. Then, whatever happened, sweep up any stray blank window below.
-      const reuse = cold ? await waitForBlankWindow(2500) : null;
+      // On a cold launch ADOPT the lone startup window the wrapper opened — pointed straight at the
+      // teleport URL (so the page is already loading) or blank as a fallback. Waiting for it to settle
+      // avoids the old race that left an orphaned window beside the teleport one. If it already holds the
+      // URL (the fast path) we DON'T re-navigate (no reload — the page keeps loading while the window
+      // rides the cursor); only a blank fallback window is navigated. Then sweep up any strays below.
+      const adopt = cold ? await waitForStartupWindow(2500) : null;
       let win, firstId;
-      if (reuse) {
-        win = reuse;
-        firstId = reuse.tabs[0].id;
-        await chrome.tabs.update(firstId, { url: tabs[0].url, active: true });
+      if (adopt) {
+        win = adopt;
+        firstId = adopt.tabs[0].id;
+        if (isBlankTabUrl(adopt.tabs[0].url || adopt.tabs[0].pendingUrl)) {
+          await chrome.tabs.update(firstId, { url: tabs[0].url, active: true });
+        }
         try { await chrome.windows.update(win.id, { focused: true }); } catch (e) {}
       } else {
         win = await chrome.windows.create({ url: tabs[0].url, focused: true });
