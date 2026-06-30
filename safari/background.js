@@ -501,16 +501,24 @@ function winTabsToObj() {
 }
 function persistWinTabs() { try { chrome.storage.session.set({ mtWinTabs: winTabsToObj() }); } catch (e) {} }
 
-// resolveProfileRole asks the wrapper which profile we're in. ONE-SHOT on the wrapper side, so cache it
-// (in storage.session too, so a resurrected worker doesn't re-query after the claim is consumed).
-async function resolveProfileRole() {
-  if (PROFILE_ROLE) return PROFILE_ROLE;
-  try { const s = await chrome.storage.session.get("mtRole"); if (s && s.mtRole) { PROFILE_ROLE = s.mtRole; return PROFILE_ROLE; } } catch (e) {}
-  try { const res = await fetch(q("/profile-role")); PROFILE_ROLE = (res.ok && (await res.json()).role) || "normal"; }
-  catch (e) { PROFILE_ROLE = "normal"; }
-  await persistRole();
-  dbg("profile role = " + PROFILE_ROLE);
-  return PROFILE_ROLE;
+// resolveProfileRole asks the wrapper which profile we're in. /profile-role is ONE-SHOT on the wrapper
+// side, so it MUST be queried exactly once: boot() is invoked 3x at launch (bare + onStartup +
+// onInstalled), and concurrent queries would consume the claim with one (teleport) and get "normal" with
+// the others (the bug). Single-flight via roleInFlight + cache in storage.session so a resurrected worker
+// reads the role instead of re-querying after the claim is gone.
+let roleInFlight = null;
+function resolveProfileRole() {
+  if (PROFILE_ROLE) return Promise.resolve(PROFILE_ROLE);
+  if (roleInFlight) return roleInFlight;
+  roleInFlight = (async () => {
+    try { const s = await chrome.storage.session.get("mtRole"); if (s && s.mtRole) { PROFILE_ROLE = s.mtRole; return PROFILE_ROLE; } } catch (e) {}
+    try { const res = await fetch(q("/profile-role")); PROFILE_ROLE = (res.ok && (await res.json()).role) || "normal"; }
+    catch (e) { PROFILE_ROLE = "normal"; }
+    await persistRole();
+    dbg("profile role = " + PROFILE_ROLE);
+    return PROFILE_ROLE;
+  })();
+  return roleInFlight;
 }
 
 function recordTab(windowId, tabId, url) {
@@ -617,7 +625,12 @@ if (chrome.alarms) {
 chrome.runtime.onStartup.addListener(async () => { await boot(); if (PROFILE_ROLE === "normal") { await stageCarryback(); await restoreCarryback(); } });
 chrome.runtime.onInstalled.addListener(() => boot());
 
-async function boot() {
+// boot() runs at most ONCE per worker (single-flight): it's called from the bare invocation below AND
+// onStartup AND onInstalled, which would otherwise run loadConfig/ensureToken/resolveProfileRole/pollLoop
+// concurrently and race (notably the one-shot /profile-role query — see resolveProfileRole).
+let bootPromise = null;
+function boot() { if (!bootPromise) bootPromise = doBoot(); return bootPromise; }
+async function doBoot() {
   startKeepAlive();
   await loadConfig();
   await ensureToken();
