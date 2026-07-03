@@ -146,14 +146,42 @@ async function captureTab(tab) {
   return { url, active: !!tab.active, scrollX: state.scrollX, scrollY: state.scrollY, videoTime: state.videoTime };
 }
 
+// ---- durable pending-close registry ----
+// pendingClose alone is IN-MEMORY: if the MV3 worker suspends mid closeWhenPossible retry loop
+// (or between the send and the ack), the close is orphaned FOREVER — the acked, already-teleported
+// source window then lingers where its drag ended (the "chrome tab left at the seam edge" report,
+// 2026-07-03). Mirror every pending close to chrome.storage.session (acked flag included) so a
+// resurrected worker — or a "recheck-closes" nudge from the wrapper, which watches the doomed
+// window by hwnd — can re-drive it to completion.
+async function pcLoad() { try { const s = await chrome.storage.session.get("mtPendClose"); return (s && s.mtPendClose) || {}; } catch (e) { return {}; } }
+function pcSave(m) { try { chrome.storage.session.set({ mtPendClose: m }); } catch (e) {} }
+async function pcSet(moveId, entry) { const m = await pcLoad(); m[moveId] = entry; pcSave(m); }
+async function pcMark(moveId, patch) { const m = await pcLoad(); if (m[moveId]) { Object.assign(m[moveId], patch); pcSave(m); } }
+async function pcDel(moveId) { const m = await pcLoad(); if (moveId in m) { delete m[moveId]; pcSave(m); } }
+const closingNow = new Set(); // moveIds with a live closeWhenPossible loop (avoid duplicate loops per worker)
+
+// recheckCloses re-drives every ACKED pending close — from boot (worker resurrection) or a
+// wrapper "recheck-closes" nudge (it sees the doomed source window still open). Un-acked entries
+// are left alone: without the peer's ack the tabs may exist ONLY here, so closing would lose them.
+async function recheckCloses(reason) {
+  const m = await pcLoad();
+  for (const id in m) {
+    if (m[id].acked && !closingNow.has(id)) {
+      dbg("recheck-closes(" + reason + "): re-driving close for " + id + " (" + m[id].type + " " + m[id].id + ")");
+      closeWhenPossible(m[id], id);
+    }
+  }
+}
+
 // teleportTab sends a single tab (the Phase-1 shortcut/context-menu path).
 async function teleportTab(tab) {
   const t = await captureTab(tab);
   if (!t) { console.warn("Teleporter: only http(s) tabs can be teleported"); return; }
   const moveId = crypto.randomUUID();
   pendingClose.set(moveId, { type: "tab", id: tab.id });
+  await pcSet(moveId, { type: "tab", id: tab.id, acked: false });
   const ok = await sendEnvelope({ v: 1, kind: "open", moveId, tabs: [t] });
-  if (!ok) pendingClose.delete(moveId);
+  if (!ok) { pendingClose.delete(moveId); pcDel(moveId); }
   else console.log("Teleporter: sent tab", t.url);
 }
 
@@ -171,8 +199,9 @@ async function teleportFocusedWindow() {
   if (!tabs.length) { console.warn("Teleporter: no http(s) tabs in the dragged window"); return; }
   const moveId = crypto.randomUUID();
   pendingClose.set(moveId, { type: "window", id: win.id });
+  await pcSet(moveId, { type: "window", id: win.id, acked: false });
   const ok = await sendEnvelope({ v: 1, kind: "open", moveId, asWindow: true, tabs });
-  if (!ok) pendingClose.delete(moveId);
+  if (!ok) { pendingClose.delete(moveId); pcDel(moveId); }
   else console.log("Teleporter: sent window with", tabs.length, "tab(s)");
 }
 
@@ -374,6 +403,10 @@ async function handleEnvelope(env) {
   // merge the teleported tab(s) into that window, like Chrome's native tab-drag merge.
   if (env.kind === "merge-drop") { await mergeTeleportDrop(env); return; }
 
+  // Merged sees an acked teleport's doomed source window STILL OPEN: re-drive its close
+  // (covers a worker suspended mid retry-loop, whose in-memory close was lost).
+  if (env.kind === "recheck-closes") { await recheckCloses("wrapper nudge"); return; }
+
   if (env.kind === "open") {
     const tabs = (env.tabs || []).filter((t) => t && t.url);
     if (!tabs.length) return;
@@ -441,10 +474,12 @@ async function handleEnvelope(env) {
   }
 
   if (env.kind === "ack") {
-    const target = pendingClose.get(env.moveId);
+    let target = pendingClose.get(env.moveId);
+    pendingClose.delete(env.moveId);
+    if (!target) { const m = await pcLoad(); target = m[env.moveId]; } // a resurrected worker: recover from the durable registry
     if (target) {
-      pendingClose.delete(env.moveId);
-      closeWhenPossible(target);
+      await pcMark(env.moveId, { acked: true }); // durably acked BEFORE closing, so a re-drive is allowed to finish it
+      closeWhenPossible(target, env.moveId);
     }
   }
 }
@@ -453,20 +488,35 @@ async function handleEnvelope(env) {
 // dragged by a TAB (rather than the title bar), Chrome holds a tab-drag session with the
 // mouse captured and silently refuses windows.remove until the user releases — so a single
 // remove no-ops and the window lingers. Retry until it's actually gone (verified via
-// get() throwing), which naturally succeeds the moment the drag is released.
-async function closeWhenPossible(target) {
+// get() throwing), which naturally succeeds the moment the drag is released. The durable
+// mtPendClose entry is cleared only on confirmed-gone, so a worker suspension mid-loop can
+// be recovered by recheckCloses (boot / the wrapper's recheck-closes nudge).
+async function closeWhenPossible(target, moveId) {
+  if (moveId) {
+    if (closingNow.has(moveId)) return; // a loop for this close is already running in this worker
+    closingNow.add(moveId);
+  }
   if (target.type === "window") suppressCarryback.add(target.id); // a teleport-AWAY close — don't carry it back
   for (let i = 0; i < 30; i++) { // ~15s ceiling
     try {
       if (target.type === "window") await chrome.windows.remove(target.id);
       else await chrome.tabs.remove(target.id);
-    } catch (e) { /* may be mid tab-drag; verify below and retry */ }
+    } catch (e) {
+      // Refused (may be mid tab-drag) — surface WHY into the wrapper's btrace so a lingering
+      // source window is diagnosable (first few attempts + every 5th).
+      if (i < 3 || i % 5 === 0) dbg("close refused (attempt " + (i + 1) + ") for " + target.type + " " + target.id + ": " + (e && e.message ? e.message : e));
+    }
     try {
       if (target.type === "window") await chrome.windows.get(target.id);
       else await chrome.tabs.get(target.id);
-    } catch (e) { return; } // get() threw → it's gone → done
+    } catch (e) { // get() threw → it's gone → done
+      if (moveId) { closingNow.delete(moveId); pcDel(moveId); }
+      return;
+    }
     await sleep(500);
   }
+  if (moveId) closingNow.delete(moveId); // ceiling hit — keep the durable entry so a later re-drive can finish it
+  dbg("close GAVE UP after ~15s for " + target.type + " " + target.id + " (still open; awaiting a re-drive)");
 }
 
 // ---------------- triggers ----------------
@@ -710,6 +760,7 @@ async function doBoot() {
   await ensureToken();
   await resolveProfileRole();
   await initWinTabs();
+  recheckCloses("boot"); // a resurrected worker finishes any acked close it lost mid-retry
   pollLoop();
   // NORMAL profile: surface any windows closed while it was offline as bookmarks now (no windows opened
   // here — restoreCarryback on a real startup does that). Idempotent: the wrapper queue drain is one-shot.
