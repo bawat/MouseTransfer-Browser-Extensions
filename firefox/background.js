@@ -185,11 +185,43 @@ async function teleportTab(tab) {
   else console.log("Teleporter: sent tab", t.url);
 }
 
-// teleportFocusedWindow sends EVERY http(s) tab of the focused window as one window-move.
+// findWindowByPxRect matches one of our windows to a screen-pixel rect the wrapper measured
+// (Win32, px), trying each standard Windows scale factor (Settings > Display offers 100-250%)
+// to map px -> our DIP bounds. Returns null when nothing is plausibly close — the caller must
+// then ABORT rather than guess.
+async function findWindowByPxRect(wl, wt, ww, wh) {
+  let wins = [];
+  try { wins = await chrome.windows.getAll({ populate: true, windowTypes: ["normal"] }); } catch (e) { return null; }
+  let best = null, bestD = Infinity;
+  for (const s of [1, 1.25, 1.5, 1.75, 2, 2.25, 2.5]) {
+    const want = { left: wl / s, top: wt / s, width: ww / s, height: wh / s };
+    for (const w of wins) {
+      if (typeof w.left !== "number") continue;
+      const d = Math.abs(w.left - want.left) + Math.abs(w.top - want.top) + Math.abs(w.width - want.width) + Math.abs(w.height - want.height);
+      if (d < bestD) { bestD = d; best = w; }
+    }
+  }
+  if (!best || bestD > 200) { dbg("capture-window: no window matches the dragged rect (bestD=" + Math.round(bestD) + ")"); return null; }
+  return best;
+}
+
+// teleportFocusedWindow sends EVERY http(s) tab of the dragged window as one window-move.
 // Invoked when Merged reports a Chrome window was dragged across the seam (capture-window).
-// The dragged window is the focused one, so getLastFocused identifies it.
-async function teleportFocusedWindow() {
-  const win = await chrome.windows.getLastFocused({ populate: true });
+// The wrapper includes the dragged window's on-screen rect; capture THAT window, matched by
+// bounds — NOT getLastFocused: this worker can be slow/cold, and by the time it runs the
+// source drag may have ended (or a tear been reverted), moving focus — focus-based capture
+// then teleported AND CLOSED the whole original window or a completely unrelated one (the
+// 2026-07-03 YouTube-tab reports). No bounds match -> ABORT: better no teleport (the window
+// just stays put) than the wrong window leaving the machine. Legacy envelopes without a rect
+// keep the focus capture.
+async function teleportFocusedWindow(env) {
+  let win = null;
+  if (env && env.ww > 0 && env.wh > 0) {
+    win = await findWindowByPxRect(env.wl, env.wt, env.ww, env.wh);
+    if (!win) { dbg("capture-window: ABORTING teleport — dragged window not found (drag reverted/closed?)"); return; }
+  } else {
+    win = await chrome.windows.getLastFocused({ populate: true });
+  }
   if (!win || !win.tabs || !win.tabs.length) return;
   const tabs = [];
   for (const tab of win.tabs) {
@@ -396,8 +428,9 @@ async function handleEnvelope(env) {
     return;
   }
 
-  // Merged tells us a Chrome window was dragged across the seam: capture+send it.
-  if (env.kind === "capture-window") { await teleportFocusedWindow(); return; }
+  // Merged tells us a Chrome window was dragged across the seam: capture+send it
+  // (env carries the dragged window's px rect — see teleportFocusedWindow).
+  if (env.kind === "capture-window") { await teleportFocusedWindow(env); return; }
 
   // Merged saw a tab tear-off ride released over another browser window's tab strip:
   // merge the teleported tab(s) into that window, like Chrome's native tab-drag merge.

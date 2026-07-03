@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Tab Teleporter (Merged)",
-  "version": "2.5",
+  "version": "2.6",
   "description": "Teleport the current tab to the other computer (via the local Merged bridge), preserving YouTube/video time and scroll position.",
   "browser_specific_settings": {
     "gecko": {

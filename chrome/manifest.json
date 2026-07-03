@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Tab Teleporter (Merged)",
-  "version": "2.5",
+  "version": "2.6",
   "description": "Teleport the current tab to the other computer (via the local Merged bridge), preserving YouTube/video time and scroll position.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzlhLabxYGS8I58wU6zb5wSEVl/0wqKB2OSB+n4UrU8NM3Ic7HgU6l6CgNKJJQYJDCi/39umx4L94ejalinE2OxRafMUeZJzkZ50y4PMby2sJMsWaR0SvgbVaErLj25O7fViFeh1oUA7MqiuTR0COry9AENBdER/yWCLbiCKzKWr1vNowzNq4yUfSvMm3in3+Bag8H6oJgBNfOEW8ABXyqdzdQ/08LJ2gIInpWFqBzeiDtnUYEqaJy9oN74/BrH6ivUwS1y9jaWN00sRhth4TD5HUNaDGtqnH/SAMva0G7eavQpSUYxMwF5ZgXq6C1ybPTZdLGY83x5SAHH3a4lMlFwIDAQAB",
   "action": {
