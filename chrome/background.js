@@ -275,6 +275,55 @@ async function wasColdLaunch() {
   return false;
 }
 
+// lastTeleportWin remembers the window created/adopted for the most recent teleport open, so a
+// follow-up "merge-drop" (the user released a TAB tear-off over another window's tab strip) knows
+// which window's tabs to move. Mirrored to storage.session: the MV3 worker can be suspended between
+// the open and the drop, and a resurrected worker must still resolve it.
+let lastTeleportWin = null; // {id, at}
+function setLastTeleportWin(id) {
+  lastTeleportWin = { id, at: Date.now() };
+  try { chrome.storage.session.set({ mtTeleWin: lastTeleportWin }); } catch (e) {}
+}
+async function getLastTeleportWin() {
+  if (lastTeleportWin) return lastTeleportWin;
+  try { const s = await chrome.storage.session.get("mtTeleWin"); return (s && s.mtTeleWin) || null; } catch (e) { return null; }
+}
+
+// mergeTeleportDrop merges the teleported window's tab(s) into an existing window — the wrapper
+// detected the ride's release landing on that window's tab strip (Chrome-style tab-drag merge).
+// The wrapper sends both rects in SCREEN PIXELS; our bounds are in DIPs — the teleport window
+// itself is the scale reference (we know it in both spaces: env.r* is its px rect at drop, and
+// chrome.windows.get gives its DIP bounds), so the target rect is mapped px->DIP and matched to
+// our nearest window. Best-effort: any miss leaves the standalone window (never a lost tab).
+async function mergeTeleportDrop(env) {
+  const tp = await getLastTeleportWin();
+  if (!tp || Date.now() - tp.at > 60000) { dbg("merge-drop: no recent teleport window to merge"); return; }
+  let tw;
+  try { tw = await chrome.windows.get(tp.id, { populate: true }); } catch (e) { dbg("merge-drop: teleport window gone"); return; }
+  if (!tw || !tw.tabs || !tw.tabs.length) return;
+  const sx = env.rw && tw.width ? tw.width / env.rw : 1; // DIP per px
+  const sy = env.rh && tw.height ? tw.height / env.rh : (env.rw && tw.width ? tw.width / env.rw : 1);
+  const want = { left: env.tl * sx, top: env.tt * sy, width: env.tw * sx, height: env.th * sy };
+  let wins = [];
+  try { wins = await chrome.windows.getAll({ windowTypes: ["normal"] }); } catch (e) { return; }
+  let best = null, bestD = Infinity;
+  for (const w of wins) {
+    if (w.id === tw.id || typeof w.left !== "number") continue;
+    const d = Math.abs(w.left - want.left) + Math.abs(w.top - want.top) + Math.abs(w.width - want.width) + Math.abs(w.height - want.height);
+    if (d < bestD) { bestD = d; best = w; }
+  }
+  // Reject a wild match: the wrapper picked a REAL window at those bounds, so the true match is
+  // close; anything further than ~a window-width off means our window list doesn't contain it.
+  if (!best || bestD > Math.max(200, want.width)) { dbg("merge-drop: no window matched the target rect (bestD=" + bestD + ")"); return; }
+  try {
+    const ids = tw.tabs.map((t) => t.id);
+    await chrome.tabs.move(ids, { windowId: best.id, index: -1 }); // teleport window auto-closes when its last tab leaves
+    await chrome.windows.update(best.id, { focused: true });
+    await chrome.tabs.update(ids[ids.length - 1], { active: true });
+    dbg("merge-drop: merged " + ids.length + " tab(s) into window #" + best.id);
+  } catch (e) { dbg("merge-drop: move failed: " + e); }
+}
+
 // reportTeleportWindow tells the wrapper the bounds of the window we just created/reused for a
 // whole-window teleport, so its ride grabs THIS window — not a restored-session or chrome://extensions
 // window that also opened on a cold launch. Best-effort.
@@ -314,6 +363,10 @@ async function handleEnvelope(env) {
 
   // Merged tells us a Chrome window was dragged across the seam: capture+send it.
   if (env.kind === "capture-window") { await teleportFocusedWindow(); return; }
+
+  // Merged saw a tab tear-off ride released over another browser window's tab strip:
+  // merge the teleported tab(s) into that window, like Chrome's native tab-drag merge.
+  if (env.kind === "merge-drop") { await mergeTeleportDrop(env); return; }
 
   if (env.kind === "open") {
     const tabs = (env.tabs || []).filter((t) => t && t.url);
@@ -368,6 +421,7 @@ async function handleEnvelope(env) {
       if (activeId) chrome.tabs.update(activeId, { active: true }).catch(() => {});
       // Cold-launch cleanup: close any stray blank startup window beside the teleport one.
       if (cold) await closeStrayBlankWindows(win.id);
+      setLastTeleportWin(win.id); // so a tab tear-off's merge-drop knows which window's tabs to move
       reportTeleportWindow(win.id); // tell the wrapper WHICH window to ride
     } else {
       const newTab = await chrome.tabs.create({ url: tabs[0].url, active: true });
