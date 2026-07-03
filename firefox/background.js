@@ -202,6 +202,7 @@ async function findWindowByPxRect(wl, wt, ww, wh) {
     }
   }
   if (!best || bestD > 200) { dbg("capture-window: no window matches the dragged rect (bestD=" + Math.round(bestD) + ")"); return null; }
+  dbg("capture-window: matched window #" + best.id + " (" + (best.tabs ? best.tabs.length : 0) + " tabs, bestD=" + Math.round(bestD) + ")");
   return best;
 }
 
