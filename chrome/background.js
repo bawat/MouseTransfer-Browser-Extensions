@@ -211,11 +211,15 @@ async function findWindowByPxRect(wl, wt, ww, wh) {
 // keep the focus capture.
 async function teleportFocusedWindow(env) {
   let win = null;
-  if (env && env.ww > 0 && env.wh > 0) {
+  if (env && typeof env.ww === "number") {
+    // A rect-aware wrapper sent this. NEVER fall back to focus capture here — even for a
+    // zero/unusable rect: focus at capture time can name the original multi-tab window (or an
+    // unrelated one) after a lost tear race, and capturing it teleports+closes the wrong thing.
+    if (!(env.ww > 0 && env.wh > 0)) { dbg("capture-window: no usable rect — ABORTING (never guess by focus)"); return; }
     win = await findWindowByPxRect(env.wl, env.wt, env.ww, env.wh);
     if (!win) { dbg("capture-window: ABORTING teleport — dragged window not found (drag reverted/closed?)"); return; }
   } else {
-    win = await chrome.windows.getLastFocused({ populate: true });
+    win = await chrome.windows.getLastFocused({ populate: true }); // legacy wrapper without a rect
   }
   if (!win || !win.tabs || !win.tabs.length) return;
   const tabs = [];
