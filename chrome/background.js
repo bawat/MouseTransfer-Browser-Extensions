@@ -516,13 +516,24 @@ async function handleEnvelope(env) {
   }
 }
 
-// closeWhenPossible removes the source tab/window once Chrome lets it. If the window was
-// dragged by a TAB (rather than the title bar), Chrome holds a tab-drag session with the
-// mouse captured and silently refuses windows.remove until the user releases — so a single
-// remove no-ops and the window lingers. Retry until it's actually gone (verified via
-// get() throwing), which naturally succeeds the moment the drag is released. The durable
-// mtPendClose entry is cleared only on confirmed-gone, so a worker suspension mid-loop can
-// be recovered by recheckCloses (boot / the wrapper's recheck-closes nudge).
+// closeWhenPossible removes the source tab/window once the browser lets it. TWO distinct
+// refusal shapes, both seen live:
+//   - remove THROWS ("Tabs cannot be edited right now"): a live TAB-DRAG session — tearing a
+//     tab holds Chrome's own move loop with the mouse captured, and tab-strip edits are
+//     refused until the user releases. Retrying naturally succeeds at the release.
+//   - remove RESOLVES but the window SURVIVES: the browser intercepted the whole-window close
+//     with a USER CONFIRM — Brave's default-ON "Close all tabs?" window-closing confirm
+//     dialog (rig-verified 2026-07-10: 30 windows.remove calls all resolved, window stayed,
+//     the dialog visible in the failure screenshot; Opera's many-tab "Confirm close" is the
+//     same family). Nobody is there to click a dialog the USER never caused — so from the
+//     2nd attempt close the window's TABS instead: tabs.remove is NOT gated by the
+//     window-closing confirm (verified working WHILE the Brave dialog was up), and the window
+//     closes with its last tab, which also dismisses the dialog. Chrome/Edge stay on the
+//     instant windows.remove path (attempt 1 succeeds; the fallback never runs).
+// Progress is verified via get() throwing — never via remove's own resolution, which the
+// confirm interception renders meaningless. The durable mtPendClose entry is cleared only on
+// confirmed-gone, so a worker suspension mid-loop can be recovered by recheckCloses (boot /
+// the wrapper's recheck-closes nudge).
 async function closeWhenPossible(target, moveId) {
   if (moveId) {
     if (closingNow.has(moveId)) return; // a loop for this close is already running in this worker
@@ -531,8 +542,20 @@ async function closeWhenPossible(target, moveId) {
   if (target.type === "window") suppressCarryback.add(target.id); // a teleport-AWAY close — don't carry it back
   for (let i = 0; i < 30; i++) { // ~15s ceiling
     try {
-      if (target.type === "window") await chrome.windows.remove(target.id);
-      else await chrome.tabs.remove(target.id);
+      if (target.type !== "window") {
+        await chrome.tabs.remove(target.id);
+      } else if (i === 0) {
+        await chrome.windows.remove(target.id);
+      } else {
+        // The window survived a RESOLVED windows.remove — assume a close-confirm interception
+        // and close its tabs instead (see the header comment). Re-populate each attempt: a
+        // still-live drag session makes tabs.remove throw (caught below), and tabs can change.
+        const w = await chrome.windows.get(target.id, { populate: true });
+        if (w.tabs && w.tabs.length) {
+          if (i < 3 || i % 5 === 0) dbg("close fallback (attempt " + (i + 1) + "): windows.remove was silently ignored for window " + target.id + " (close-confirm dialog?) — removing its " + w.tabs.length + " tab(s) instead");
+          await chrome.tabs.remove(w.tabs.map((t) => t.id));
+        }
+      }
     } catch (e) {
       // Refused (may be mid tab-drag) — surface WHY into the wrapper's btrace so a lingering
       // source window is diagnosable (first few attempts + every 5th).
