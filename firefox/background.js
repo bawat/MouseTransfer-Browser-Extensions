@@ -1,6 +1,11 @@
-// Cross-engine shim: Firefox/Safari expose promise-based APIs on `browser`; their `chrome`
-// namespace is callback-style, which the promise/await code below would break on. Point
-// `chrome` at `browser` so the identical code runs unchanged. No-op on Chromium (no `browser`).
+// Cross-engine shim: point `chrome` at the promise-based `browser` namespace so the identical
+// promise/await code below runs unchanged. REQUIRED on Firefox, whose `chrome.*` alias is
+// callback-style. On Safari it is a harmless normalization rather than a requirement: per Apple,
+// "Safari web extensions support both the `chrome.*` and `browser.*` namespaces" and "both the
+// callback and `Promise` approaches for asynchronous APIs"
+// (https://developer.apple.com/documentation/safariservices/assessing-your-safari-web-extension-s-browser-compatibility)
+// — we still normalize onto `browser` so all three builds execute the same object paths.
+// No-op on Chromium (no `browser` global).
 if (typeof browser !== "undefined") { globalThis.chrome = browser; }
 
 
@@ -368,6 +373,10 @@ async function getLastTeleportWin() {
 // chrome.windows.get gives its DIP bounds), so the target rect is mapped px->DIP and matched to
 // our nearest window. Best-effort: any miss leaves the standalone window (never a lost tab).
 async function mergeTeleportDrop(env) {
+  // Safari cannot merge: `tabs.move` is unsupported there (Apple, "Assessing your Safari web
+  // extension's browser compatibility": "tabs.move — Not supported."; MDN BCD safari:false agrees).
+  // Leave the teleported window standalone — the documented any-miss fallback, never a lost tab.
+  if (!chrome.tabs.move) { dbg("merge-drop: tabs.move unsupported on this browser — leaving standalone window"); return; }
   const tp = await getLastTeleportWin();
   if (!tp || Date.now() - tp.at > 60000) { dbg("merge-drop: no recent teleport window to merge"); return; }
   let tw;
@@ -762,6 +771,12 @@ async function ensureCarrybackFolder() {
 // stageCarryback drains the wrapper queue into mousetransfer-toopen bookmark subfolders (one per window).
 // No windows are opened — so a worker resurrection mid-session never pops windows; it just persists them.
 async function stageCarryback() {
+  // Safari has NO bookmarks API (Apple's compatibility page lists no bookmarks support; MDN BCD
+  // webextensions/api/bookmarks: safari version_added=false). GET /carryback-drain is ONE-SHOT and
+  // destructive — draining with nowhere to stage would silently lose the windows. Without bookmarks,
+  // leave the queue with the wrapper (durable in carryback.json) and open it directly on the next
+  // real startup instead (restoreCarryback's direct path).
+  if (!(chrome.bookmarks && chrome.bookmarks.create)) { dbg("carryback: bookmarks API unavailable — leaving queue staged in the wrapper"); return; }
   let pending = [];
   try { const res = await fetch(q("/carryback-drain")); pending = (res.ok && (await res.json()).windows) || []; } catch (e) { return; }
   if (!pending.length) return;
@@ -780,6 +795,11 @@ async function stageCarryback() {
 // a real browser startup (chrome.runtime.onStartup), so carried-back windows appear alongside the user's
 // own session-resume — never mid-session.
 async function restoreCarryback() {
+  // No bookmarks API (Safari): open the wrapper's queued windows DIRECTLY. This runs only on a real
+  // browser startup (runtime.onStartup) — exactly when opening windows is safe. The bookmark staging
+  // exists solely to bridge MID-SESSION drains to the next startup, and without bookmarks we never
+  // drain mid-session (see stageCarryback), so nothing is lost by skipping the staging medium.
+  if (!(chrome.bookmarks && chrome.bookmarks.getChildren)) { await openCarrybackDirect(); return; }
   const folder = await findCarrybackFolder(); if (!folder) return;
   let subs = [];
   try { subs = await chrome.bookmarks.getChildren(folder.id); } catch (e) { return; }
@@ -797,6 +817,25 @@ async function restoreCarryback() {
   }
   try { await chrome.bookmarks.removeTree(folder.id); } catch (e) {} // clear after restoring
   dbg("carryback: restored + cleared " + opened + " window(s)");
+}
+// openCarrybackDirect drains the wrapper queue and opens each carried-back window immediately —
+// the bookmarks-free (Safari) restore path. Only ever called from the real-startup context above,
+// so the mid-session-window-popping hazard the bookmark staging guards against cannot occur here.
+async function openCarrybackDirect() {
+  let pending = [];
+  try { const res = await fetch(q("/carryback-drain")); pending = (res.ok && (await res.json()).windows) || []; } catch (e) { return; }
+  if (!pending.length) return;
+  let opened = 0;
+  for (const win of pending) {
+    const urls = (win.tabs || []).filter((u) => /^https?:/i.test(u));
+    if (!urls.length) continue;
+    try {
+      const w = await chrome.windows.create({ url: urls[0] });
+      for (let i = 1; i < urls.length; i++) await chrome.tabs.create({ windowId: w.id, url: urls[i], active: false });
+      opened++;
+    } catch (e) {}
+  }
+  dbg("carryback: opened " + opened + "/" + pending.length + " window(s) directly (no bookmarks API)");
 }
 
 // ---------------- boot ----------------

@@ -1,8 +1,13 @@
 {
   "manifest_version": 3,
   "name": "Tab Teleporter (Merged)",
-  "version": "2.9",
+  "version": "2.10",
   "description": "Teleport the current tab to the other computer (via the local Merged bridge), preserving YouTube/video time and scroll position.",
+  "browser_specific_settings": {
+    "safari": {
+      "strict_min_version": "16.4"
+    }
+  },
   "action": {
     "default_title": "Teleport this tab to the other computer"
   },
@@ -16,8 +21,7 @@
     "tabs",
     "storage",
     "scripting",
-    "alarms",
-    "bookmarks"
+    "alarms"
   ],
   "host_permissions": [
     "http://127.0.0.1/*",
