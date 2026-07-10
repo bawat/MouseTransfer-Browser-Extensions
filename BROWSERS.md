@@ -18,7 +18,7 @@ manifest and packaging differ per engine.
 |---|---|---|---|---|---|
 | 1 | Google Chrome | Chromium | `chrome/` | Chrome Web Store | **Submitted (unlisted), in review** |
 | 2 | Microsoft Edge | Chromium | `chrome/` | Microsoft Edge Add-ons (Partner Center) — or installs Chrome Web Store items directly | Needs Edge dev account |
-| 3 | Safari | WebKit | `safari/` | Mac App Store (via Xcode) | Needs macOS + Xcode + Apple Developer acct |
+| 3 | Safari | WebKit | `safari/` | Mac App Store, or a notarized Developer ID app outside it (via Xcode) | Source prepped + gap-audited; needs macOS + Xcode + Apple Developer acct — see `safari/README.md` |
 | 4 | Firefox | Gecko | `firefox/` | addons.mozilla.org (AMO) | Ready to submit; needs AMO account |
 | 5 | Opera | Chromium | `chrome/` | Opera Addons | Needs Opera dev account |
 | 6 | Brave | Chromium | `chrome/` | Installs directly from the Chrome Web Store | Covered once #1 publishes |
