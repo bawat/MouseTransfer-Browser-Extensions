@@ -562,13 +562,15 @@ async function closeWhenPossible(target, moveId) {
       } else if (i === 0) {
         await chrome.windows.remove(target.id);
       } else {
-        // The window survived a RESOLVED windows.remove — assume a close-confirm interception
-        // and close its tabs instead (see the header comment). Re-populate each attempt: a
-        // still-live drag session makes tabs.remove throw (caught below), and tabs can change.
+        // The window survived a RESOLVED windows.remove — a close-confirm interception. Close its
+        // tabs ONE AT A TIME (never a bulk tabs.remove) — see the header comment: a single-tab
+        // remove slips past a "close multiple tabs?" confirm that would swallow the bulk call
+        // (360 Safe). Re-populate each attempt: a still-live drag session makes tabs.remove throw
+        // (caught below), and the tab set shrinks as we go.
         const w = await chrome.windows.get(target.id, { populate: true });
         if (w.tabs && w.tabs.length) {
-          if (i < 3 || i % 5 === 0) dbg("close fallback (attempt " + (i + 1) + "): windows.remove was silently ignored for window " + target.id + " (close-confirm dialog?) — removing its " + w.tabs.length + " tab(s) instead");
-          await chrome.tabs.remove(w.tabs.map((t) => t.id));
+          if (i < 3 || i % 5 === 0) dbg("close fallback (attempt " + (i + 1) + "): windows.remove was silently ignored for window " + target.id + " (close-confirm dialog?) — closing its " + w.tabs.length + " tab(s) one at a time");
+          for (const t of w.tabs) await chrome.tabs.remove(t.id); // one-at-a-time; a throw (live drag) is caught below + retried next attempt
         }
       }
     } catch (e) {
