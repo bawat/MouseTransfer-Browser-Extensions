@@ -186,18 +186,47 @@ async function teleportTab(tab) {
 async function findWindowByPxRect(wl, wt, ww, wh) {
   let wins = [];
   try { wins = await chrome.windows.getAll({ populate: true, windowTypes: ["normal"] }); } catch (e) { return null; }
+  const normals = wins.filter(w => typeof w.left === "number");
+  // Instrumentation (surfaces into the wrapper's btrace via /debug): the wrapper measured
+  // wl,wt,ww,wh from Win32 GetWindowRect of the dragged top-level window. Log every candidate's
+  // chrome.windows bounds so a QQ-vs-360-vs-Chrome frame-bounds divergence is READABLE from a single
+  // trace line. For stock Chromium frames (Chrome/Edge) AND 360 Safe's custom `360se6_Frame`,
+  // chrome.windows bounds == GetWindowRect (bestD≈0). QQ Browser's skinned `QQBrowser_WidgetWin_1`
+  // frame reports chrome.windows bounds that STATICALLY diverge from GetWindowRect (~the skin/panel
+  // offset), so bestD lands ~389-409 even AT REST and with a REAL physical mouse — proven by 360
+  // teleporting cleanly on the identical physical gesture while QQ aborts (which rules out the older
+  // "the post-cross warp drags the still-held window off the latched rect" theory: 360's window warps
+  // the same and still matches). See the single-window fallback below.
+  dbg("capture-window: want(px)=" + wl + "," + wt + "," + ww + "," + wh + " candidates=" +
+      (normals.map(w => "#" + w.id + "[" + w.left + "," + w.top + "," + w.width + "," + w.height +
+        " tabs=" + (w.tabs ? w.tabs.length : 0) + "]").join(" ") || "(none)"));
   let best = null, bestD = Infinity;
   for (const s of [1, 1.25, 1.5, 1.75, 2, 2.25, 2.5]) {
     const want = { left: wl / s, top: wt / s, width: ww / s, height: wh / s };
-    for (const w of wins) {
-      if (typeof w.left !== "number") continue;
+    for (const w of normals) {
       const d = Math.abs(w.left - want.left) + Math.abs(w.top - want.top) + Math.abs(w.width - want.width) + Math.abs(w.height - want.height);
       if (d < bestD) { bestD = d; best = w; }
     }
   }
-  if (!best || bestD > 200) { dbg("capture-window: no window matches the dragged rect (bestD=" + Math.round(bestD) + ")"); return null; }
-  dbg("capture-window: matched window #" + best.id + " (" + (best.tabs ? best.tabs.length : 0) + " tabs, bestD=" + Math.round(bestD) + ")");
-  return best;
+  if (best && bestD <= 200) {
+    dbg("capture-window: matched window #" + best.id + " (" + (best.tabs ? best.tabs.length : 0) + " tabs, bestD=" + Math.round(bestD) + ")");
+    return best;
+  }
+  // Strict rect match FAILED. The rect is ONLY EVER a disambiguator among multiple windows — when
+  // this browser has exactly ONE normal window there is nothing to disambiguate, so a frame whose
+  // chrome.windows bounds statically diverge from GetWindowRect (QQ) still resolves unambiguously to
+  // that one window. This is NOT a tolerance bump: the ≤200 gate above is untouched, so multi-window
+  // matching stays strict (a wrong-window grab remains impossible) and the Chrome/Edge/360 fast path
+  // is byte-identical (their single window already matches at bestD≈0, never reaching here). The
+  // wrapper pushes capture-window ONLY on a CONFIRMED browser-window seam crossing, so the lone
+  // window IS the one the user dragged; capturing it is the intended whole-window teleport.
+  if (normals.length === 1) {
+    dbg("capture-window: strict rect match failed (bestD=" + Math.round(bestD) + ") but exactly ONE window exists — capturing it (custom-frame bounds divergence, e.g. QQ) window #" +
+        normals[0].id + " bounds=" + normals[0].left + "," + normals[0].top + "," + normals[0].width + "," + normals[0].height);
+    return normals[0];
+  }
+  dbg("capture-window: no window matches the dragged rect (bestD=" + Math.round(bestD) + "; " + normals.length + " candidate windows — cannot disambiguate a divergent-frame browser with multiple open windows)");
+  return null;
 }
 
 // teleportFocusedWindow sends EVERY http(s) tab of the dragged window as one window-move.
