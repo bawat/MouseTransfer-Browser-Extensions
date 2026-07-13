@@ -186,7 +186,15 @@ async function teleportTab(tab) {
 async function findWindowByPxRect(wl, wt, ww, wh) {
   let wins = [];
   try { wins = await chrome.windows.getAll({ populate: true, windowTypes: ["normal"] }); } catch (e) { return null; }
-  const normals = wins.filter(w => typeof w.left === "number");
+  // Ignore DEGENERATE zero-size windows: a real dragged top-level window always has a positive
+  // width/height, and some skinned forks (QQ Browser) split a multi-URL launch into the visible
+  // window PLUS a phantom 0x0 window holding the remaining tabs (rig-observed 2026-07-13: a 3-tab
+  // launch became #A[150,110,1000x700 tabs=1] + #B[52,52,0x0 tabs=2]). Counting that 0x0 window as a
+  // real candidate makes normals.length===2, which defeats BOTH the strict rect match (its bounds
+  // match nothing) AND the single-window fallback below (which needs exactly one), so the whole-window
+  // capture aborts. A 0x0 window is never what the user dragged — drop it so the visible window is the
+  // lone candidate and the fallback can capture it.
+  const normals = wins.filter(w => typeof w.left === "number" && w.width > 0 && w.height > 0);
   // Instrumentation (surfaces into the wrapper's btrace via /debug): the wrapper measured
   // wl,wt,ww,wh from Win32 GetWindowRect of the dragged top-level window. Log every candidate's
   // chrome.windows bounds so a QQ-vs-360-vs-Chrome frame-bounds divergence is READABLE from a single
