@@ -586,18 +586,21 @@ async function closeWhenPossible(target, moveId) {
       if (target.type !== "window") {
         await chrome.tabs.remove(target.id);
       } else {
-        // Close a teleported-AWAY window's tabs ONE AT A TIME — NEVER windows.remove. windows.remove is
-        // a QUIT-ALL that trips a native "Quit Opera? closing N tabs" MODAL on Opera-family (owner-observed
-        // 2026-07-14: the modal blocks the whole close, and the wrapper can't dismiss it because Opera
-        // shares Chrome's window class — so windows.remove-first left the source lingering ~25s). Closing
-        // tabs INDIVIDUALLY never raises that quit-all dialog — each tabs.remove closes one tab and the
-        // LAST one closes the window. This IS the intended design (close each tab individually); Chrome/
-        // Edge close fine this way too (a few tabs.remove vs one windows.remove). Re-populate each attempt:
-        // the tab set shrinks + a still-live drag makes tabs.remove throw (caught below), retried next go.
+        // Close a teleported-AWAY window WITHOUT windows.remove — windows.remove is a QUIT-ALL that trips
+        // a native "Quit Opera? closing N tabs" MODAL on Opera-family (owner-observed 2026-07-14: the modal
+        // blocks the whole close, and the wrapper can't dismiss it because Opera shares Chrome's window
+        // class — so windows.remove-first left the source lingering ~25s). Remove ALL-BUT-ONE tab in ONE
+        // bulk tabs.remove (leaving 1 tab is NOT a quit-all, so no modal), then close the LAST tab which
+        // closes the window. Owner-preferred over one-at-a-time (2026-07-14): the N-1 is a single call, and
+        // only the last-tab close could surface a quit-confirm (a single tab, which the wrapper's aggressive
+        // close can dismiss). Chrome/Edge close fine this way too. Re-populate each attempt: the tab set
+        // shrinks + a still-live drag makes tabs.remove throw (caught below) so we retry next attempt.
         const w = await chrome.windows.get(target.id, { populate: true });
         if (w.tabs && w.tabs.length) {
-          if (i < 3 || i % 5 === 0) dbg("close (attempt " + (i + 1) + "): closing window " + target.id + "'s " + w.tabs.length + " tab(s) ONE AT A TIME (no windows.remove — avoids the quit-all modal)");
-          for (const t of w.tabs) await chrome.tabs.remove(t.id); // one-at-a-time; a throw (live drag) is caught below + retried next attempt
+          const ids = w.tabs.map((t) => t.id);
+          if (i < 3 || i % 5 === 0) dbg("close (attempt " + (i + 1) + "): window " + target.id + " has " + ids.length + " tab(s) — removing all-but-one at once, then the last (no windows.remove — avoids the quit-all modal)");
+          if (ids.length > 1) await chrome.tabs.remove(ids.slice(0, -1)); // all-but-one in ONE bulk call (a subset, NOT a quit-all)
+          await chrome.tabs.remove(ids[ids.length - 1]);                  // the last tab -> the window closes
         }
       }
     } catch (e) {
