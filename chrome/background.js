@@ -752,6 +752,37 @@ chrome.tabs.onRemoved.addListener((tabId, info) => {
 chrome.runtime.onSuspend.addListener(() => { try { chrome.storage.session.set({ mtWinTabs: winTabsToObj(), mtRole: PROFILE_ROLE }); } catch (e) {} });
 chrome.windows.onRemoved.addListener((windowId) => { onWindowClosed(windowId); });
 
+// ---- window/tab state push (for the wrapper's Yandex drag-from-maximize tab-blacklist) ----
+// The wrapper's pollMaximizeRestore needs a maximized window's tab COUNT to compute where the tab strip
+// ends: a custom-frame browser (Yandex) draws an HTCLIENT title bar that can't be told from a tab by
+// hit-test, so the count + the strip layout is how the wrapper knows which part of the title is a tab
+// (blacklist) vs the empty caption (restore). An MV3 worker can't be polled synchronously, so we PUSH
+// the state to the bridge on load and whenever it changes. Bounds are chrome.windows DIP bounds (a
+// worker has no px access); the wrapper matches its px window rect tolerantly. Best-effort — a failed
+// push just leaves the wrapper on its move-loop fallback.
+async function emitWinState() {
+  let wins;
+  try { wins = await chrome.windows.getAll({ populate: true, windowTypes: ["normal"] }); } catch (e) { return; }
+  const windows = wins.map((w) => ({ l: w.left | 0, t: w.top | 0, w: w.width | 0, h: w.height | 0,
+    tabs: (w.tabs ? w.tabs.length : 0) }));
+  try {
+    if (!cfg.token) await ensureToken();
+    if (!cfg.token) return;
+    await fetch(q("/winstate"), { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ windows }) });
+  } catch (e) {}
+}
+let _winStateTimer = null;
+function pushWinState() { clearTimeout(_winStateTimer); _winStateTimer = setTimeout(emitWinState, 120); } // debounce a burst
+chrome.tabs.onCreated.addListener(() => pushWinState());
+chrome.tabs.onRemoved.addListener(() => pushWinState());
+chrome.tabs.onAttached.addListener(() => pushWinState());
+chrome.tabs.onDetached.addListener(() => pushWinState());
+chrome.windows.onCreated.addListener(() => pushWinState());
+chrome.windows.onRemoved.addListener(() => pushWinState());
+chrome.windows.onFocusChanged.addListener(() => pushWinState());
+if (chrome.windows.onBoundsChanged) chrome.windows.onBoundsChanged.addListener(() => pushWinState()); // newer Chromium; guarded
+
 // onWindowClosed carries a whole closed window back to the normal profile — ONLY in the teleport profile,
 // ONLY for a genuine user close (not a teleport-away), and only if it had http(s) tabs. Robust against a
 // fresh (resurrected) worker: role + tabs are recovered from storage.session when the in-memory copies are
@@ -894,6 +925,7 @@ async function doBoot() {
   await initWinTabs();
   recheckCloses("boot"); // a resurrected worker finishes any acked close it lost mid-retry
   pollLoop();
+  emitWinState(); // push the initial window/tab state so the wrapper's tab-blacklist has it before any drag
   // NORMAL profile: surface any windows closed while it was offline as bookmarks now (no windows opened
   // here — restoreCarryback on a real startup does that). Idempotent: the wrapper queue drain is one-shot.
   if (PROFILE_ROLE === "normal") await stageCarryback();
