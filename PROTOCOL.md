@@ -36,11 +36,23 @@ as "not the bridge". An endpoint the user sets in the options is used as is, wit
 | new, Linux/BSD | 24817 | — |
 | old, Windows | 24812 (fallback) | 24812 |
 
-The extension fetches its
-per-install token automatically from `POST /hello` (it sends a fixed `X-Teleport-Client:
-merged-tab-teleporter` header, which a web page can't send — the CORS preflight is refused —
-so only an extension with `127.0.0.1` host access can get the token). No manual paste; the
-endpoint/token can still be overridden in the extension's options.
+The extension fetches its per-install token automatically from `POST /hello`. No manual paste;
+the endpoint/token can still be overridden in the extension's options. Merged hands the token out
+only when all of these hold:
+
+- the method is `POST`;
+- the request carries the fixed header `X-Teleport-Client: merged-tab-teleporter` — a web page
+  cannot send it (the CORS preflight is refused), an extension with `127.0.0.1` host access can;
+- if an `Origin` header is present (measured: Chromium and Firefox send it on the extension's
+  `POST` requests), it is `chrome-extension://<id>` for one of OUR ids — the unpacked id derived
+  from the manifest `key` (`fggfgcnldlnknodemngelbmceoadpoll`) or the Chrome Web Store id — or
+  any `moz-extension://` / `safari-web-extension://` origin (those ids are random per install
+  and cannot be pinned). Any other origin — another extension, a web page — gets `403`.
+  No `Origin` at all is accepted.
+
+This raises the bar against another installed extension asking for the token; it is not a proof
+of identity: an extension that can rewrite its own request headers can strip or forge `Origin`.
+A build published under another store id must be added to Merged's allowlist first.
 
 | Method & path | Purpose |
 |---|---|
@@ -58,16 +70,31 @@ extension ignores, and every flow works without them.
 
 **`client`** — every request (including `/hello`) also carries `&client=<id>`: a random UUID the
 extension makes once per browser profile and keeps in `storage.local`. Several browsers or
-profiles can run the extension against one Merged; this is how Merged tells them apart (for
-per-client event queues and for choosing which browser receives a teleport). A Merged that does
-not use it ignores the unknown query parameter.
+profiles can run the extension against one Merged; this is how Merged tells them apart. A Merged
+that does not use it ignores the unknown query parameter.
+
+How a Merged that uses it delivers (each client has its own `/events` queue; a request with no
+`client` is the *legacy* client and gets exactly the old single-queue behaviour):
+
+| Envelope | Goes to |
+|---|---|
+| `open` (from the peer) | ONE live client: the one that reported `/focus` most recently, else the one that polled most recently |
+| `ack` (from the peer) | the client that sent the matching `open` (Merged remembers `moveId` → client from `/send`); every live client if unknown |
+| `capture-window` | the client(s) whose browser (by User-Agent) can own the dragged window; every live client if none |
+| `merge-drop`, `recheck-closes`, `reload`, anything else | every live client |
+
+A client is *live* while it has a poll parked or polled within the last poll period (~25 s).
+An envelope that arrives while no client is live waits for the first client that polls (the
+cold-launch case: Merged starts the browser, its extension polls, it gets the envelope). On a
+machine with no extension at all, Merged's own extensionless receive path may claim an `open`
+that no extension has taken — exactly one of the two ever gets it.
 
 | Method & path | Body | Purpose |
 |---|---|---|
 | `POST /focus?token=<t>&client=<id>` | none | A normal window of this browser profile gained focus (a burst of focus changes sends one report, ~120 ms after the last). Lets Merged deliver an incoming teleport to the browser the user is in. |
 | `GET /carryback-drain?token=<t>&peek=1` | — | The carry-back queue (whole windows closed in the teleport profile). The extension always asks with `peek=1`. A Merged that supports it answers `{"peek":true,"windows":[{"id":"<string>","tabs":["…"],"at":<ns>},…]}` and removes **nothing**; one that does not ignores `peek`, answers `{"windows":[…]}` without `"peek"` and empties its queue — the extension then puts back, with `POST /carryback {"tabs":[…]}`, every window it failed to store or open. |
 | `POST /carryback-ack?token=<t>` | `{"ids":["<string>",…]}` | Only after a `peek` drain: remove these windows from the queue (they were stored as bookmarks or opened). Windows are named by the string `id`, never by `at`: a nanosecond timestamp does not survive a JavaScript number. A peek window without a string `id` is left queued. |
-| `POST /source-kept?token=<t>` | `{"phase":"captured"\|"closed","moveId":"…","cid":<capture-window cid or null>,"kept":N,"sent":N}` (`sent` only with `captured`) | After a whole-window teleport the source window will **stay open** because it holds `kept` tabs that were not sent (browser-internal pages, local files, tabs opened after the capture). `captured` is sent before the `open`; `closed` once the close has finished and the window is still open. Merged must not force-close that window. Sent only when `kept > 0`. |
+| `POST /source-kept?token=<t>` | `{"phase":"captured"\|"closed","moveId":"…","cid":<capture-window cid or null>,"kept":N,"sent":N}` (`sent` only with `captured`) | After a whole-window teleport the source window will **stay open** because it holds `kept` tabs that were not sent (browser-internal pages, local files, tabs opened after the capture). `captured` is sent — and its answer awaited (at most 1 s) — before the `open`; `closed` once the close has finished and the window is still open. Sent only when `kept > 0`. Merged then does not force-close that window, dismiss a close confirm on it, or nudge (`recheck-closes`) about it; and independently of this report it never force-closes a source window before the teleport was acked. |
 
 ## Envelopes
 
@@ -118,13 +145,16 @@ The extension finds the window whose bounds match that rect (trying the standard
 scale factors, since its own bounds are in DIPs; with exactly one open window, that window)
 and sends its tabs to the peer as an `open` with `asWindow: true`.
 
-Optional (2.19+): `cid` — any JSON string or number Merged chooses to name this capture; the
-extension echoes it unchanged in `/source-kept`, so Merged knows which source window is meant.
+Optional (2.19+): `cid` — any JSON string or number Merged chooses to name this capture (Merged
+sends the dragged window's handle as a decimal string); the extension echoes it unchanged in
+`/source-kept`, so Merged knows which source window is meant.
 
 Optional (2.19+): `lone` — boolean. The extension's **single-window fallback** captures the only
 window it can see when no window's bounds match the rect; it exists for browsers whose skinned
 frame reports bounds that differ from the Win32 rect (QQ Browser). `"lone": false` turns that
-fallback off: no match means abort. Merged should send it for stock-frame browsers, where a
+fallback off: no match means abort. Merged sends it for browsers whose frame bounds are recorded
+to match Win32 (Chrome/Edge/Brave/Opera/Vivaldi — the stock Chromium frame — and 360 Safe), and
+whenever more than one install of the dragged browser is connected, where a
 miss means the dragged window is one the extension cannot see (an incognito/private window)
 and the fallback would capture — and then close — the user's other window. Absent means the
 fallback stays on (today's behaviour).
@@ -139,6 +169,9 @@ After the peer's `ack` the extension closes **only the tabs it sent** (each stil
 was sent from) and blank new-tab pages of that window. Any other tab — a `chrome://` page, a
 local file, a tab opened after the capture, a sent tab that navigated elsewhere — stays, and
 keeps the window open.
+
+If two or more windows match the rect equally well (identical bounds, or within one DIP per
+edge), the extension takes the **focused** one, and aborts if none of them is focused.
 
 If the rect is missing, zero-sized, or matches none of several windows, the extension
 **aborts** and the window stays where it is. It never falls back to "the focused window":
