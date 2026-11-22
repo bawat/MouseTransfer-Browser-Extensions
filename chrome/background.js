@@ -832,7 +832,7 @@ async function onWindowClosed(windowId) {
   if (suppressCarryback.delete(windowId)) return;   // a teleport-away close — skip
   // FAST PATH: in-memory state present (worker alive). Closing the teleport browser's LAST window makes
   // Chrome EXIT, killing any in-flight async work — so send SYNCHRONOUSLY here, before any await, via
-  // sendCarryback (navigator.sendBeacon, which is designed to survive a context teardown).
+  // sendCarryback (a keepalive fetch, or sendBeacon where the engine has one — see sendCarryback).
   if (PROFILE_ROLE === "teleport") {
     const m = winTabs.get(windowId);
     if (m && m.size) { sendCarryback(Array.from(m.values()), windowId); winTabs.delete(windowId); persistWinTabs(); return; }
@@ -853,15 +853,26 @@ async function onWindowClosed(windowId) {
   sendCarryback(Array.from(m.values()), windowId);
 }
 
-// sendCarryback POSTs a closed window's tabs to the wrapper so it survives the browser/worker teardown
-// that closing the last window triggers: navigator.sendBeacon queues the request in the network stack and
-// is delivered even as the context dies (a plain fetch is cut off). keepalive-fetch is the fallback.
+// sendCarryback POSTs a closed window's tabs to the wrapper in a form meant to outlive the
+// browser/worker teardown that closing the last window triggers (a plain fetch can be cut off).
+// Which form depends on the engine, because sendBeacon exists only on a window-like Navigator:
+//   - Chromium (MV3 service worker): self.navigator is a WorkerNavigator with NO sendBeacon, so it is
+//     always fetch(..., {keepalive: true}). Measured 2026-11-22, headless Edge 125 probe extension:
+//     typeof navigator.sendBeacon === "undefined"; the keepalive fetch arrived.
+//   - Firefox (MV3 background "scripts" = an event PAGE): a window Navigator, sendBeacon present and
+//     used. Measured 2026-11-22, headless Firefox 127 temporary add-on: typeof === "function",
+//     it returned true and the beacon arrived.
+//   - Safari (manifest background.service_worker): a service worker per spec, so expected to take the
+//     keepalive path like Chromium. NOT measured (no Safari to test on).
+// Neither probe measured delivery DURING a browser exit — only that each path sends.
 function sendCarryback(tabs, windowId) {
   const url = q("/carryback"), body = JSON.stringify({ tabs });
-  let ok = false;
-  try { ok = navigator.sendBeacon(url, body); } catch (e) {}
-  if (!ok) { try { fetch(url, { method: "POST", body, keepalive: true }); } catch (e) {} }
-  dbg("carryback: queued closed window " + windowId + " (" + tabs.length + " tabs, beacon=" + ok + ")");
+  let beacon = false;
+  if (typeof navigator !== "undefined" && typeof navigator.sendBeacon === "function") {
+    try { beacon = navigator.sendBeacon(url, body); } catch (e) {} // false = the beacon was not queued
+  }
+  if (!beacon) { try { fetch(url, { method: "POST", body, keepalive: true }).catch(() => {}); } catch (e) {} }
+  dbg("carryback: queued closed window " + windowId + " (" + tabs.length + " tabs, via " + (beacon ? "sendBeacon" : "keepalive fetch") + ")");
 }
 
 async function findCarrybackFolder() {

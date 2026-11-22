@@ -70,7 +70,7 @@ The shared `background.js` feature-detects each of these and degrades as describ
 | `bookmarks.*` | **Not supported** (MDN BCD `webextensions/api/bookmarks`: safari `false`; absent from Apple's compatibility page) | Carry-back skips the bookmark staging and opens queued windows directly on the next real startup; the one-shot `/carryback-drain` is never consumed without a place to put it. The `bookmarks` permission is dropped from this manifest. |
 | `tabs.move` | **Not supported** — "tabs.move: Not supported." (Apple compatibility page) | A tear-off merge-drop leaves the teleported window standalone (the documented any-miss fallback). |
 | `runtime.onSuspend` | "API exists, but has no effect" (MDN BCD) | Harmless — it's a belt on top of `storage.session` mirroring. |
-| `navigator.sendBeacon` in a service worker | Beacon is specified on `Navigator` (window), not `WorkerNavigator` | Carry-back already falls back to `fetch(…, { keepalive: true })`. |
+| `navigator.sendBeacon` in a service worker | Beacon is specified on `Navigator` (window), not `WorkerNavigator`. Not measured on Safari; measured absent in a Chromium MV3 service worker (Edge 125) and present in Firefox's MV3 event page (Firefox 127) | Carry-back feature-detects it and otherwise sends with `fetch(…, { keepalive: true })`, which is the path Safari is expected to take. |
 | `storage.sync` | "Storage mechanism implemented, but syncing not supported" (Apple) | Not used. |
 
 Everything else the extension uses is supported: `tabs`/`windows`/`runtime`/`commands`/
