@@ -1,0 +1,13 @@
+{
+  "name": "tab-teleporter",
+  "private": true,
+  "description": "Tab Teleporter browser extension: src/ is the source, chrome/ firefox/ safari/ are generated.",
+  "scripts": {
+    "build": "node tools/build.mjs",
+    "check": "node tools/build.mjs --check",
+    "test": "node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
