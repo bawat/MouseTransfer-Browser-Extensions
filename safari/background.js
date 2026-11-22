@@ -1003,6 +1003,7 @@ async function closeWhenPossible(target, moveId) {
   if (target.type === "window") suppressCarryback.add(target.id); // a teleport-AWAY close — don't carry it back
   const finish = (plan) => {
     if (moveId) { closingNow.delete(moveId); pcDel(moveId); }
+    dbg("close: done for " + target.type + " " + target.id + " — kept " + (plan.kept || 0) + (target.type === "window" ? (plan.windowOpen ? ", window still open" : ", window closed") : ""));
     if (plan.navigated) dbg("close: " + plan.navigated + " sent tab(s) navigated to another page before the ack — left open");
     if (target.type === "window" && plan.windowOpen && plan.kept > 0) {
       suppressCarryback.delete(target.id);
