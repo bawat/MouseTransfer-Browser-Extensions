@@ -5,7 +5,8 @@
   "scripts": {
     "build": "node tools/build.mjs",
     "check": "node tools/build.mjs --check",
-    "test": "node --test test/*.test.mjs"
+    "test": "node --test test/*.test.mjs",
+    "smoke": "node tools/smoke-edge.mjs"
   },
   "engines": {
     "node": ">=18"

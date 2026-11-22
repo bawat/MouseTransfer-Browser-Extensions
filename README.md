@@ -55,6 +55,14 @@ generates (it never deletes, so `safari/README.md` is safe). Bump `version` in
 `test/harness.mjs` runs the real `src/background.js` in Node with a fake `chrome`, `fetch`
 and clock, so behaviour can be tested without a browser.
 
+**Real-browser smoke test (opt-in, Windows + Edge, ~2 min):** `npm run smoke`
+(`node tools/smoke-edge.mjs`). It starts a fake bridge on a free loopback port, loads a copy
+of the built `chrome/` folder whose endpoints point at it (the real bridge on 24817/24812 is
+never contacted) into **headless** Edge with a throw-away profile, drives the extension
+through the bridge (boot, open, a refused non-http open, a malformed envelope, a whole-window
+capture and close, idle keep-alive), prints PASS/FAIL with the evidence from the bridge's
+request log, then kills the browser tree and checks nothing is left. Not part of `npm test`.
+
 ## Install (Chrome / Chromium, unpacked)
 
 1. Run Merged on **both** computers (`merged serve` on one, `merged connect <host>` on the
