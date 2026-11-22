@@ -1,3 +1,17 @@
+// GENERATED from src/background.js by tools/build.mjs. Do not edit this copy: edit src/ and run
+// `node tools/build.mjs` (CI/tests run `node tools/build.mjs --check`). See README.md.
+
+// Cross-engine shim: point `chrome` at the promise-based `browser` namespace so the identical
+// promise/await code below runs unchanged. REQUIRED on Firefox, whose `chrome.*` alias is
+// callback-style. On Safari it is a harmless normalization rather than a requirement: per Apple,
+// "Safari web extensions support both the `chrome.*` and `browser.*` namespaces" and "both the
+// callback and `Promise` approaches for asynchronous APIs"
+// (https://developer.apple.com/documentation/safariservices/assessing-your-safari-web-extension-s-browser-compatibility)
+// — we still normalize onto `browser` so all three builds execute the same object paths.
+// No-op on Chromium (no `browser` global).
+if (typeof browser !== "undefined") { globalThis.chrome = browser; }
+
+
 // background.js — Tab Teleporter (Merged)
 //
 // Talks to the LOCAL Merged bridge over loopback HTTP (no separate server, no off-box

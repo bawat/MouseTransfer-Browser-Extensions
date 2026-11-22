@@ -1,0 +1,4 @@
+# Normalise text files to LF in the repository; a checkout may still use CRLF (core.autocrlf).
+# tools/build.mjs writes LF and its --check folds CRLF to LF, so it gives the same answer either way.
+* text=auto
+*.png binary

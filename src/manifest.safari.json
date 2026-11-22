@@ -1,0 +1,12 @@
+{
+  "browser_specific_settings": {
+    "safari": {
+      "strict_min_version": "16.4"
+    }
+  },
+  "permissions": {
+    "$remove": [
+      "bookmarks"
+    ]
+  }
+}

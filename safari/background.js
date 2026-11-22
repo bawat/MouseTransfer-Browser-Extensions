@@ -1,3 +1,6 @@
+// GENERATED from src/background.js by tools/build.mjs. Do not edit this copy: edit src/ and run
+// `node tools/build.mjs` (CI/tests run `node tools/build.mjs --check`). See README.md.
+
 // Cross-engine shim: point `chrome` at the promise-based `browser` namespace so the identical
 // promise/await code below runs unchanged. REQUIRED on Firefox, whose `chrome.*` alias is
 // callback-style. On Safari it is a harmless normalization rather than a requirement: per Apple,
@@ -203,7 +206,15 @@ async function teleportTab(tab) {
 async function findWindowByPxRect(wl, wt, ww, wh) {
   let wins = [];
   try { wins = await chrome.windows.getAll({ populate: true, windowTypes: ["normal"] }); } catch (e) { return null; }
-  const normals = wins.filter(w => typeof w.left === "number");
+  // Ignore DEGENERATE zero-size windows: a real dragged top-level window always has a positive
+  // width/height, and some skinned forks (QQ Browser) split a multi-URL launch into the visible
+  // window PLUS a phantom 0x0 window holding the remaining tabs (rig-observed 2026-07-13: a 3-tab
+  // launch became #A[150,110,1000x700 tabs=1] + #B[52,52,0x0 tabs=2]). Counting that 0x0 window as a
+  // real candidate makes normals.length===2, which defeats BOTH the strict rect match (its bounds
+  // match nothing) AND the single-window fallback below (which needs exactly one), so the whole-window
+  // capture aborts. A 0x0 window is never what the user dragged — drop it so the visible window is the
+  // lone candidate and the fallback can capture it.
+  const normals = wins.filter(w => typeof w.left === "number" && w.width > 0 && w.height > 0);
   // Instrumentation (surfaces into the wrapper's btrace via /debug): the wrapper measured
   // wl,wt,ww,wh from Win32 GetWindowRect of the dragged top-level window. Log every candidate's
   // chrome.windows bounds so a QQ-vs-360-vs-Chrome frame-bounds divergence is READABLE from a single
@@ -594,18 +605,22 @@ async function closeWhenPossible(target, moveId) {
     try {
       if (target.type !== "window") {
         await chrome.tabs.remove(target.id);
-      } else if (i === 0) {
-        await chrome.windows.remove(target.id);
       } else {
-        // The window survived a RESOLVED windows.remove — a close-confirm interception. Close its
-        // tabs ONE AT A TIME (never a bulk tabs.remove) — see the header comment: a single-tab
-        // remove slips past a "close multiple tabs?" confirm that would swallow the bulk call
-        // (360 Safe). Re-populate each attempt: a still-live drag session makes tabs.remove throw
-        // (caught below), and the tab set shrinks as we go.
+        // Close a teleported-AWAY window WITHOUT windows.remove — windows.remove is a QUIT-ALL that trips
+        // a native "Quit Opera? closing N tabs" MODAL on Opera-family (owner-observed 2026-07-14: the modal
+        // blocks the whole close, and the wrapper can't dismiss it because Opera shares Chrome's window
+        // class — so windows.remove-first left the source lingering ~25s). Remove ALL-BUT-ONE tab in ONE
+        // bulk tabs.remove (leaving 1 tab is NOT a quit-all, so no modal), then close the LAST tab which
+        // closes the window. Owner-preferred over one-at-a-time (2026-07-14): the N-1 is a single call, and
+        // only the last-tab close could surface a quit-confirm (a single tab, which the wrapper's aggressive
+        // close can dismiss). Chrome/Edge close fine this way too. Re-populate each attempt: the tab set
+        // shrinks + a still-live drag makes tabs.remove throw (caught below) so we retry next attempt.
         const w = await chrome.windows.get(target.id, { populate: true });
         if (w.tabs && w.tabs.length) {
-          if (i < 3 || i % 5 === 0) dbg("close fallback (attempt " + (i + 1) + "): windows.remove was silently ignored for window " + target.id + " (close-confirm dialog?) — closing its " + w.tabs.length + " tab(s) one at a time");
-          for (const t of w.tabs) await chrome.tabs.remove(t.id); // one-at-a-time; a throw (live drag) is caught below + retried next attempt
+          const ids = w.tabs.map((t) => t.id);
+          if (i < 3 || i % 5 === 0) dbg("close (attempt " + (i + 1) + "): window " + target.id + " has " + ids.length + " tab(s) — removing all-but-one at once, then the last (no windows.remove — avoids the quit-all modal)");
+          if (ids.length > 1) await chrome.tabs.remove(ids.slice(0, -1)); // all-but-one in ONE bulk call (a subset, NOT a quit-all)
+          await chrome.tabs.remove(ids[ids.length - 1]);                  // the last tab -> the window closes
         }
       }
     } catch (e) {
@@ -772,6 +787,37 @@ chrome.tabs.onRemoved.addListener((tabId, info) => {
 chrome.runtime.onSuspend.addListener(() => { try { chrome.storage.session.set({ mtWinTabs: winTabsToObj(), mtRole: PROFILE_ROLE }); } catch (e) {} });
 chrome.windows.onRemoved.addListener((windowId) => { onWindowClosed(windowId); });
 
+// ---- window/tab state push (for the wrapper's Yandex drag-from-maximize tab-blacklist) ----
+// The wrapper's pollMaximizeRestore needs a maximized window's tab COUNT to compute where the tab strip
+// ends: a custom-frame browser (Yandex) draws an HTCLIENT title bar that can't be told from a tab by
+// hit-test, so the count + the strip layout is how the wrapper knows which part of the title is a tab
+// (blacklist) vs the empty caption (restore). An MV3 worker can't be polled synchronously, so we PUSH
+// the state to the bridge on load and whenever it changes. Bounds are chrome.windows DIP bounds (a
+// worker has no px access); the wrapper matches its px window rect tolerantly. Best-effort — a failed
+// push just leaves the wrapper on its move-loop fallback.
+async function emitWinState() {
+  let wins;
+  try { wins = await chrome.windows.getAll({ populate: true, windowTypes: ["normal"] }); } catch (e) { return; }
+  const windows = wins.map((w) => ({ l: w.left | 0, t: w.top | 0, w: w.width | 0, h: w.height | 0,
+    tabs: (w.tabs ? w.tabs.length : 0) }));
+  try {
+    if (!cfg.token) await ensureToken();
+    if (!cfg.token) return;
+    await fetch(q("/winstate"), { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ windows }) });
+  } catch (e) {}
+}
+let _winStateTimer = null;
+function pushWinState() { clearTimeout(_winStateTimer); _winStateTimer = setTimeout(emitWinState, 120); } // debounce a burst
+chrome.tabs.onCreated.addListener(() => pushWinState());
+chrome.tabs.onRemoved.addListener(() => pushWinState());
+chrome.tabs.onAttached.addListener(() => pushWinState());
+chrome.tabs.onDetached.addListener(() => pushWinState());
+chrome.windows.onCreated.addListener(() => pushWinState());
+chrome.windows.onRemoved.addListener(() => pushWinState());
+chrome.windows.onFocusChanged.addListener(() => pushWinState());
+if (chrome.windows.onBoundsChanged) chrome.windows.onBoundsChanged.addListener(() => pushWinState()); // newer Chromium; guarded
+
 // onWindowClosed carries a whole closed window back to the normal profile — ONLY in the teleport profile,
 // ONLY for a genuine user close (not a teleport-away), and only if it had http(s) tabs. Robust against a
 // fresh (resurrected) worker: role + tabs are recovered from storage.session when the in-memory copies are
@@ -914,6 +960,7 @@ async function doBoot() {
   await initWinTabs();
   recheckCloses("boot"); // a resurrected worker finishes any acked close it lost mid-retry
   pollLoop();
+  emitWinState(); // push the initial window/tab state so the wrapper's tab-blacklist has it before any drag
   // NORMAL profile: surface any windows closed while it was offline as bookmarks now (no windows opened
   // here — restoreCarryback on a real startup does that). Idempotent: the wrapper queue drain is one-shot.
   if (PROFILE_ROLE === "normal") await stageCarryback();
