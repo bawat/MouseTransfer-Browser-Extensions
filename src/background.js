@@ -420,8 +420,11 @@ async function teleportTab(tab) {
   const t = await captureTab(tab);
   if (!t) { console.warn("Teleporter: only http(s) tabs can be teleported"); return; }
   const moveId = crypto.randomUUID();
-  pendingClose.set(moveId, { type: "tab", id: tab.id });
-  await pcSet(moveId, { type: "tab", id: tab.id, acked: false });
+  // url = the page as it was when sent: if the tab has navigated elsewhere by the time the ack
+  // arrives, it is a different page the user is now using, and it is kept (see closeWhenPossible).
+  const entry = { type: "tab", id: tab.id, url: tab.url, acked: false };
+  pendingClose.set(moveId, entry);
+  await pcSet(moveId, entry);
   const ok = await sendEnvelope({ v: 1, kind: "open", moveId, tabs: [t] });
   if (!ok) { pendingClose.delete(moveId); pcDel(moveId); }
   else console.log("Teleporter: sent tab", t.url);
@@ -510,11 +513,21 @@ async function teleportFocusedWindow(env) {
   if (!win.tabs || !win.tabs.length) return;
   // All tabs at once (each bounded by CAPTURE_INJECT_TIMEOUT_MS); Promise.all keeps the window's
   // tab order in the envelope.
-  const tabs = (await Promise.all(win.tabs.map((tab) => captureTab(tab)))).filter(Boolean);
+  const caps = await Promise.all(win.tabs.map((tab) => captureTab(tab)));
+  const tabs = caps.filter(Boolean);
   if (!tabs.length) { console.warn("Teleporter: no http(s) tabs in the dragged window"); return; }
   const moveId = crypto.randomUUID();
-  pendingClose.set(moveId, { type: "window", id: win.id });
-  await pcSet(moveId, { type: "window", id: win.id, acked: false });
+  // The close after the ack removes ONLY the tabs sent here (plus blank new-tab pages) — never a
+  // chrome:// page, a local file, an extension page or a tab opened after this moment.
+  const sent = win.tabs.filter((tab, i) => caps[i]).map((tab) => ({ id: tab.id, url: tab.url }));
+  const kept = win.tabs.filter((tab, i) => !caps[i] && !isBlankTabUrl(tab.url || tab.pendingUrl)).length;
+  const cid = env.cid === undefined ? null : env.cid;
+  const entry = { type: "window", id: win.id, tabs: sent, cid, acked: false };
+  pendingClose.set(moveId, entry);
+  await pcSet(moveId, entry);
+  // Tell the wrapper BEFORE the open goes out that this window will survive the teleport, so it
+  // does not force-close it (it does that for close-confirm browsers). Optional endpoint.
+  if (kept > 0) reportSourceKept({ phase: "captured", moveId, cid, sent: sent.length, kept });
   const ok = await sendEnvelope({ v: 1, kind: "open", moveId, asWindow: true, tabs });
   if (!ok) { pendingClose.delete(moveId); pcDel(moveId); }
   else console.log("Teleporter: sent window with", tabs.length, "tab(s)");
@@ -864,63 +877,120 @@ async function handleEnvelope(env) {
   }
 }
 
-// closeWhenPossible removes the source tab/window once the browser lets it. TWO distinct
-// refusal shapes, both seen live:
-//   - remove THROWS ("Tabs cannot be edited right now"): a live TAB-DRAG session — tearing a
-//     tab holds Chrome's own move loop with the mouse captured, and tab-strip edits are
-//     refused until the user releases. Retrying naturally succeeds at the release.
-//   - remove RESOLVES but the window SURVIVES: the browser intercepted the whole-window close
-//     with a USER CONFIRM — Brave's default-ON "Close all tabs?" window-closing confirm
-//     dialog (rig-verified 2026-07-10: 30 windows.remove calls all resolved, window stayed,
-//     the dialog visible in the failure screenshot; Opera's many-tab "Confirm close" is the
-//     same family). Nobody is there to click a dialog the USER never caused — so from the
-//     2nd attempt close the window's TABS instead: tabs.remove is NOT gated by the
-//     window-closing confirm (verified working WHILE the Brave dialog was up), and the window
-//     closes with its last tab, which also dismisses the dialog. Chrome/Edge stay on the
-//     instant windows.remove path (attempt 1 succeeds; the fallback never runs).
-// Progress is verified via get() throwing — never via remove's own resolution, which the
-// confirm interception renders meaningless. The durable mtPendClose entry is cleared only on
-// confirmed-gone, so a worker suspension mid-loop can be recovered by recheckCloses (boot /
-// the wrapper's recheck-closes nudge).
+// sameDoc reports whether two URLs name the same document (a #fragment change is the same page).
+function sameDoc(a, b) {
+  const strip = (u) => ((u || "") + "").split("#")[0];
+  return strip(a) === strip(b);
+}
+
+// reportSourceKept tells the wrapper that a teleported-away source window will stay open because it
+// holds tabs that were not sent (phase "captured": predicted at capture; phase "closed": what was
+// actually left after the close). The wrapper watches the source window after a whole-window
+// teleport and, on close-confirm browsers (360, QQ, Opera, Vivaldi), FORCE-CLOSES it after ~2 s
+// (cmd/filedrag_windows.go watchDoomedSourceClose) — which would destroy the kept tabs. cid echoes
+// the capture-window envelope's "cid" so the wrapper can tell which window. POST /source-kept is
+// OPTIONAL: a wrapper that does not know it answers 404, which is ignored.
+function reportSourceKept(info) {
+  dbg("source-kept: " + info.phase + " moveId=" + info.moveId + " kept=" + info.kept + (info.sent !== undefined ? " sent=" + info.sent : ""));
+  try {
+    bridgeFetch("/source-kept", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(info) }).catch(() => {});
+  } catch (e) {}
+}
+
+// planClose works out what is left to close for a pending-close entry, from the browser's CURRENT
+// state (re-read on every attempt: tabs close, move and navigate while the close is retried).
+//   { done: true }                      nothing of ours is left
+//   { done: false, remove: [tabIds] }   close these (the window closes with its last tab if nothing is kept)
+// and kept = the tabs that will keep the window open.
+// Entries come in three shapes:
+//   - window with tabs:[{id,url}] (2.19+): only those tabs (each still on the page it was sent
+//     from) plus blank/new-tab pages of that window; any other tab is kept and keeps the window.
+//   - window without tabs (written by an older version): every tab of the window, as before.
+//   - tab: that tab, unless it has navigated to another page since it was sent (url, 2.19+).
+async function planClose(target) {
+  if (target.type !== "window") {
+    let t;
+    try { t = await chrome.tabs.get(target.id); } catch (e) { return { done: true, kept: 0 }; }
+    if (target.url && !sameDoc(t.pendingUrl || t.url, target.url)) return { done: true, kept: 1, navigated: 1 };
+    return { done: false, remove: [t.id], kept: 0 };
+  }
+  if (!Array.isArray(target.tabs)) {
+    let w;
+    try { w = await chrome.windows.get(target.id, { populate: true }); } catch (e) { return { done: true, kept: 0 }; }
+    const ids = (w.tabs || []).map((t) => t.id);
+    return ids.length ? { done: false, remove: ids, kept: 0, legacy: true } : { done: true, kept: 0 };
+  }
+  const mine = [];
+  let navigated = 0;
+  for (const c of target.tabs) {
+    let t;
+    try { t = await chrome.tabs.get(c.id); } catch (e) { continue; } // already gone
+    if (!sameDoc(t.pendingUrl || t.url, c.url)) { navigated++; continue; } // a different page now: not ours to close
+    mine.push(t.id);
+  }
+  let others = [];
+  let windowOpen = true;
+  try {
+    const w = await chrome.windows.get(target.id, { populate: true });
+    const ids = new Set(mine);
+    others = (w.tabs || []).filter((t) => !ids.has(t.id));
+  } catch (e) { windowOpen = false; }
+  const blanks = others.filter((t) => isBlankTabUrl(t.url || t.pendingUrl)).map((t) => t.id);
+  const kept = others.length - blanks.length;
+  // Blank pages go with the window (a window that held web pages and a new-tab page still
+  // disappears). Once nothing of ours is left they are closed only if they are ALL that is left.
+  const remove = mine.length ? mine.concat(blanks) : (kept === 0 ? blanks : []);
+  if (!remove.length) return { done: true, kept, navigated, windowOpen };
+  return { done: false, remove, kept, navigated, windowOpen };
+}
+
+// closeWhenPossible removes what a teleport sent away, once the ack says it arrived and the browser
+// lets us. It NEVER uses windows.remove: that is a QUIT-ALL which trips a native "Quit Opera? closing
+// N tabs" modal on Opera-family (owner-observed 2026-07-14; the wrapper cannot dismiss it, since
+// Opera shares Chrome's window class) — and it would also take tabs that were never sent. Instead the
+// tabs to close are removed ALL-BUT-ONE in one bulk tabs.remove (a subset close is not a quit-all, so
+// no modal), then the LAST; when nothing is kept the window closes with that last tab. tabs.remove is
+// not gated by Brave's window-closing confirm either (rig-verified 2026-07-10 while the dialog was
+// up). Two refusal shapes, both retried every 500 ms for ~15 s:
+//   - remove THROWS ("Tabs cannot be edited right now"): a live tab-drag session holds Chrome's
+//     move loop; it succeeds once the user releases.
+//   - remove RESOLVES but the tab survives: a close-confirm interception. Progress is therefore
+//     judged only by re-reading the state (planClose), never by remove's own resolution.
+// The durable mtPendClose entry is cleared only once nothing of ours is left, so a worker suspended
+// mid-loop is recovered by recheckCloses (boot / the wrapper's recheck-closes nudge). If the window
+// stays open because it holds kept tabs, the wrapper is told (reportSourceKept) and the window is a
+// normal window again (a later user close of it is carried back as usual).
 async function closeWhenPossible(target, moveId) {
   if (moveId) {
     if (closingNow.has(moveId)) return; // a loop for this close is already running in this worker
     closingNow.add(moveId);
   }
   if (target.type === "window") suppressCarryback.add(target.id); // a teleport-AWAY close — don't carry it back
-  for (let i = 0; i < 30; i++) { // ~15s ceiling
-    try {
-      if (target.type !== "window") {
-        await chrome.tabs.remove(target.id);
-      } else {
-        // Close a teleported-AWAY window WITHOUT windows.remove — windows.remove is a QUIT-ALL that trips
-        // a native "Quit Opera? closing N tabs" MODAL on Opera-family (owner-observed 2026-07-14: the modal
-        // blocks the whole close, and the wrapper can't dismiss it because Opera shares Chrome's window
-        // class — so windows.remove-first left the source lingering ~25s). Remove ALL-BUT-ONE tab in ONE
-        // bulk tabs.remove (leaving 1 tab is NOT a quit-all, so no modal), then close the LAST tab which
-        // closes the window. Owner-preferred over one-at-a-time (2026-07-14): the N-1 is a single call, and
-        // only the last-tab close could surface a quit-confirm (a single tab, which the wrapper's aggressive
-        // close can dismiss). Chrome/Edge close fine this way too. Re-populate each attempt: the tab set
-        // shrinks + a still-live drag makes tabs.remove throw (caught below) so we retry next attempt.
-        const w = await chrome.windows.get(target.id, { populate: true });
-        if (w.tabs && w.tabs.length) {
-          const ids = w.tabs.map((t) => t.id);
-          if (i < 3 || i % 5 === 0) dbg("close (attempt " + (i + 1) + "): window " + target.id + " has " + ids.length + " tab(s) — removing all-but-one at once, then the last (no windows.remove — avoids the quit-all modal)");
-          if (ids.length > 1) await chrome.tabs.remove(ids.slice(0, -1)); // all-but-one in ONE bulk call (a subset, NOT a quit-all)
-          await chrome.tabs.remove(ids[ids.length - 1]);                  // the last tab -> the window closes
-        }
-      }
-    } catch (e) {
-      // Refused (may be mid tab-drag) — surface WHY into the wrapper's btrace so a lingering
-      // source window is diagnosable (first few attempts + every 5th).
-      if (i < 3 || i % 5 === 0) dbg("close refused (attempt " + (i + 1) + ") for " + target.type + " " + target.id + ": " + (e && e.message ? e.message : e));
+  const finish = (plan) => {
+    if (moveId) { closingNow.delete(moveId); pcDel(moveId); }
+    if (plan.navigated) dbg("close: " + plan.navigated + " sent tab(s) navigated to another page before the ack — left open");
+    if (target.type === "window" && plan.windowOpen && plan.kept > 0) {
+      suppressCarryback.delete(target.id);
+      reportSourceKept({ phase: "closed", moveId, cid: target.cid === undefined ? null : target.cid, kept: plan.kept });
     }
-    try {
-      if (target.type === "window") await chrome.windows.get(target.id);
-      else await chrome.tabs.get(target.id);
-    } catch (e) { // get() threw → it's gone → done
-      if (moveId) { closingNow.delete(moveId); pcDel(moveId); }
-      return;
+  };
+  for (let i = 0; i < 30; i++) { // ~15s ceiling
+    let plan;
+    try { plan = await planClose(target); } catch (e) { plan = null; dbg("close: could not read state for " + target.type + " " + target.id + ": " + e); }
+    if (plan && plan.done) { finish(plan); return; }
+    if (plan) {
+      try {
+        if (i < 3 || i % 5 === 0) dbg("close (attempt " + (i + 1) + "): " + target.type + " " + target.id + " — removing " + plan.remove.length + " tab(s), keeping " + plan.kept + (plan.legacy ? " (pre-2.19 entry: whole window)" : ""));
+        const ids = plan.remove;
+        if (ids.length > 1) await chrome.tabs.remove(ids.slice(0, -1)); // all-but-one in ONE bulk call (a subset, NOT a quit-all)
+        await chrome.tabs.remove(ids[ids.length - 1]);                  // the last -> the window closes if nothing is kept
+      } catch (e) {
+        // Refused (may be mid tab-drag) — surface WHY into the wrapper's btrace (first few + every 5th).
+        if (i < 3 || i % 5 === 0) dbg("close refused (attempt " + (i + 1) + ") for " + target.type + " " + target.id + ": " + (e && e.message ? e.message : e));
+      }
+      let after = null;
+      try { after = await planClose(target); } catch (e) {}
+      if (after && after.done) { finish(after); return; }
     }
     await sleep(500);
   }

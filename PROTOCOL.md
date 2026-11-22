@@ -48,7 +48,17 @@ endpoint/token can still be overridden in the extension's options.
 | `GET /events?token=<t>` | **Long-poll** for the next envelope the peer sent us. `200` + envelope JSON when one arrives; `204` after ~25s idle (just poll again). |
 
 Use a token query param (not a header) to avoid a CORS preflight. Keep one `/events`
-long-poll outstanding at all times.
+long-poll outstanding at all times. A `403` means the token is wrong (Merged's token changed):
+drop it and fetch the current one from `/hello`, after a pause.
+
+### Optional endpoints (2.19+)
+
+The extension calls these on any Merged; one that does not know them answers `404`, which the
+extension ignores, and every flow works without them.
+
+| Method & path | Body | Purpose |
+|---|---|---|
+| `POST /source-kept?token=<t>` | `{"phase":"captured"\|"closed","moveId":"…","cid":<capture-window cid or null>,"kept":N,"sent":N}` (`sent` only with `captured`) | After a whole-window teleport the source window will **stay open** because it holds `kept` tabs that were not sent (browser-internal pages, local files, tabs opened after the capture). `captured` is sent before the `open`; `closed` once the close has finished and the window is still open. Merged must not force-close that window. Sent only when `kept > 0`. |
 
 ## Envelopes
 
@@ -98,6 +108,14 @@ window's on-screen rect in screen **pixels** (Win32 `GetWindowRect`) and are **r
 The extension finds the window whose bounds match that rect (trying the standard display
 scale factors, since its own bounds are in DIPs; with exactly one open window, that window)
 and sends its tabs to the peer as an `open` with `asWindow: true`.
+
+Optional (2.19+): `cid` — any JSON string or number Merged chooses to name this capture; the
+extension echoes it unchanged in `/source-kept`, so Merged knows which source window is meant.
+
+After the peer's `ack` the extension closes **only the tabs it sent** (each still on the page it
+was sent from) and blank new-tab pages of that window. Any other tab — a `chrome://` page, a
+local file, a tab opened after the capture, a sent tab that navigated elsewhere — stays, and
+keeps the window open.
 
 If the rect is missing, zero-sized, or matches none of several windows, the extension
 **aborts** and the window stays where it is. It never falls back to "the focused window":
