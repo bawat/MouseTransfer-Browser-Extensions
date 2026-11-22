@@ -232,6 +232,7 @@ function makeChrome(opts, record, world) {
       },
       create: (props) => {
         record("windows.create", props);
+        if (opts.windowsCreate) { const r = opts.windowsCreate(props); if (r) return r; }
         const id = world.nextId++;
         const urls = props && props.url ? (Array.isArray(props.url) ? props.url : [props.url]) : ["chrome://newtab/"];
         const win = { id, left: 0, top: 0, width: 800, height: 600, type: "normal", focused: !!(props && props.focused),
@@ -256,6 +257,7 @@ function makeChrome(opts, record, world) {
       get: (id) => { record("tabs.get", id); const f = findTab(id); return f ? Promise.resolve({ ...f.t }) : noSuch("tab", id); },
       create: (props) => {
         record("tabs.create", props);
+        if (opts.tabsCreate) { const r = opts.tabsCreate(props); if (r) return r; }
         let win = props && props.windowId != null ? findWin(props.windowId) : (world.windows.find((y) => y.focused) || world.windows[0]);
         if (!win) { win = { id: world.nextId++, left: 0, top: 0, width: 800, height: 600, type: "normal", focused: true, tabs: [] }; world.windows.push(win); }
         const t = { id: world.nextId++, url: props && props.url, active: !!(props && props.active), windowId: win.id };
@@ -296,6 +298,7 @@ function makeChrome(opts, record, world) {
 //   fetch: (req) => Response|Promise         router; req = {url, path, port, method, headers, body, search, opts}
 //   navigator: {...}                         the context's navigator (default: {} = a service worker
 //                                            without sendBeacon, as measured in Chromium)
+//   tabsCreate / windowsCreate / tabsRemove: (args) => Promise|undefined   override one call
 //   omitApis: ["bookmarks", "tabs.move"]     remove APIs to model an engine without them
 //   storageHook: (area, op, arg) => Error|undefined   make a storage call reject
 //   start: <ms>                              initial fake time

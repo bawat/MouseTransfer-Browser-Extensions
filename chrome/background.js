@@ -162,8 +162,12 @@ async function probeBridge() {
   bridge.base = base;
   bridge.stale = false;
   bridge.next = 0; // a later re-probe starts again from the preferred port
-  if (!cfg.token) {
+  // The bridge's /hello is the authority on the token: adopt it when we have none, AND when ours
+  // differs (the wrapper's token changed; ours would only earn 403s).
+  if (cfg.token !== token) {
+    const changed = !!cfg.token;
     cfg.token = token;
+    if (changed) dbg("bridge: token changed — adopted the bridge's current token");
     await storageSet("local", { token }, "token"); // the token only: storing the endpoint is what pinned old installs to 24812
     console.log("Teleporter: auto-configured from the Merged bridge at " + base);
   }
@@ -180,13 +184,30 @@ function q(path) {
 // it every turn — finds the port that answers now. An HTTP error status is an answer from the
 // bridge and changes nothing. A user-set endpoint is never re-probed (there is nothing else to try).
 // The fetch starts synchronously, before the first await (sendCarryback relies on that).
+// A 403 is the bridge saying our TOKEN is wrong (its token changed: a reinstall, a new profile of
+// the wrapper). Every authenticated bridge handler answers a bad token with 403 "bad token", so the
+// token is dropped (here and in storage) and the next ensureBridge() fetches the current one — the
+// poll loop's pause paces that, so a bridge that keeps refusing cannot cause a tight loop. Only the
+// token the request USED is dropped: a request still in flight with an old token must not throw
+// away a new one fetched meanwhile.
 async function bridgeFetch(path, init, extraQuery) {
+  const usedToken = cfg.token;
+  let res;
   try {
-    return await fetch(q(path) + (extraQuery || ""), init);
+    res = await fetch(q(path) + (extraQuery || ""), init);
   } catch (e) {
     if (!cfg.endpoint) bridge.stale = true;
     throw e;
   }
+  if (res.status === 403 && usedToken && cfg.token === usedToken) dropToken(path);
+  return res;
+}
+function dropToken(path) {
+  dbg("bridge: token rejected (403 on " + path + ") — fetching the current one");
+  cfg.token = "";
+  bridge.notBefore = Date.now() + BRIDGE_RETRY_MS; // the re-probe waits the usual pause, whoever triggers it
+  try { chrome.storage.local.remove("token").catch((e) => dbg("storage.local.remove(token) failed: " + e)); }
+  catch (e) { dbg("storage.local.remove(token) threw: " + e); }
 }
 
 // ---------------- transport ----------------
@@ -217,22 +238,38 @@ async function pollLoop() {
   polling = true;
   for (;;) {
     if (bridgeNeedsProbe() && !(await ensureBridge())) { await sleep(BRIDGE_RETRY_MS); continue; }
+    // TRANSPORT: only the request and its body. A failure here is "bridge down / not answering"
+    // and keeps its backoff.
+    let env;
     try {
       const askedAt = Date.now();
       const res = await bridgeFetch("/events");
       if (res.status === 200) {
-        const env = await res.json();
-        await handleEnvelope(env);
+        env = await res.json();
+      } else if (res.status === 403) {
+        // bridgeFetch has dropped the rejected token; the next turn re-probes for the current one.
+        await sleep(BRIDGE_RETRY_MS);
+        continue;
       } else if (res.status !== 204) {
         await sleep(2000);
-      } else if (Date.now() - askedAt < 1000) {
+        continue;
+      } else {
         // A 204 is the bridge's idle timeout and normally arrives after a long hold. One that
         // comes back at once means the bridge is not holding the request, and re-asking with no
-        // pause would be the same tight loop as the lifeline's (see startLifeline).
-        await sleep(1000);
+        // pause would be a tight loop.
+        if (Date.now() - askedAt < 1000) await sleep(1000);
+        continue;
       }
     } catch (e) {
       await sleep(3000); // bridge down; back off and retry
+      continue;
+    }
+    // HANDLER: a failure here says nothing about the bridge. Report it and poll again at once (the
+    // bridge has already handed this envelope over, so nothing is gained by waiting).
+    try {
+      await handleEnvelope(env);
+    } catch (e) {
+      dbg("handler failed: kind=" + (env && env.kind) + (env && env.moveId ? " moveId=" + env.moveId : "") + ": " + (e && e.stack ? String(e.stack).split("\n").slice(0, 3).join(" | ") : e));
     }
   }
 }
