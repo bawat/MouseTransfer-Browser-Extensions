@@ -56,8 +56,15 @@ drop it and fetch the current one from `/hello`, after a pause.
 The extension calls these on any Merged; one that does not know them answers `404`, which the
 extension ignores, and every flow works without them.
 
+**`client`** — every request (including `/hello`) also carries `&client=<id>`: a random UUID the
+extension makes once per browser profile and keeps in `storage.local`. Several browsers or
+profiles can run the extension against one Merged; this is how Merged tells them apart (for
+per-client event queues and for choosing which browser receives a teleport). A Merged that does
+not use it ignores the unknown query parameter.
+
 | Method & path | Body | Purpose |
 |---|---|---|
+| `POST /focus?token=<t>&client=<id>` | none | A normal window of this browser profile gained focus (a burst of focus changes sends one report, ~120 ms after the last). Lets Merged deliver an incoming teleport to the browser the user is in. |
 | `POST /source-kept?token=<t>` | `{"phase":"captured"\|"closed","moveId":"…","cid":<capture-window cid or null>,"kept":N,"sent":N}` (`sent` only with `captured`) | After a whole-window teleport the source window will **stay open** because it holds `kept` tabs that were not sent (browser-internal pages, local files, tabs opened after the capture). `captured` is sent before the `open`; `closed` once the close has finished and the window is still open. Merged must not force-close that window. Sent only when `kept > 0`. |
 
 ## Envelopes

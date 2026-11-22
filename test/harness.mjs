@@ -216,6 +216,7 @@ function makeChrome(opts, record, world, tools) {
       },
     },
     windows: {
+      WINDOW_ID_NONE: -1, // chrome.windows.WINDOW_ID_NONE (Chrome API reference: -1)
       onCreated: ev("windows.onCreated"), onRemoved: ev("windows.onRemoved"),
       onFocusChanged: ev("windows.onFocusChanged"), onBoundsChanged: ev("windows.onBoundsChanged"),
       getAll: (q) => {

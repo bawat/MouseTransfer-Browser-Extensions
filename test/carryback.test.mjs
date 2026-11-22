@@ -22,7 +22,7 @@ test("sendCarryback: sendBeacon present and queued -> no fetch", async () => {
   h.fn("sendCarryback")(["https://a/"], 5);
   await h.flush();
   assert.equal(beacons.length, 1);
-  assert.match(beacons[0].url, /\/carryback\?token=tok$/);
+  assert.match(beacons[0].url, /\/carryback\?token=tok&client=[0-9a-f-]+$/);
   assert.equal(h.fetched("/carryback").length, 0);
   assert.ok(h.dbgLines().some((l) => l.includes("via sendBeacon")));
 });

@@ -51,7 +51,12 @@ const BRIDGE_RETRY_MS = 2000;
 const BRIDGE_PROBE_TIMEOUT_MS = 3000;
 
 // cfg.endpoint is the USER's endpoint, "" when they set none (then the defaults above apply).
-let cfg = { endpoint: "", token: "" };
+// cfg.clientId names THIS install (this browser profile) to the bridge: several browsers or
+// profiles can run the extension against one bridge, and the bridge needs to tell them apart
+// (per-client queues, which browser gets an incoming teleport). Random, made once per profile and
+// kept in storage.local; sent as the "client" query parameter on every bridge request. A bridge
+// that does not know the parameter ignores it.
+let cfg = { endpoint: "", token: "", clientId: "" };
 
 // bridge is where requests go now. base = the endpoint that last answered /hello (or the first
 // candidate before anything has); stale = a request to base failed to connect, so the next
@@ -76,7 +81,7 @@ const pendingClose = new Map();
 // value equal to DEFAULT_ENDPOINT is treated as "no endpoint set" too (Options saved the default).
 async function loadConfig() {
   let local = {};
-  try { local = (await chrome.storage.local.get(["endpoint", "token"])) || {}; }
+  try { local = (await chrome.storage.local.get(["endpoint", "token", "clientId"])) || {}; }
   catch (e) { dbg("config: storage.local.get failed: " + e); }
   let ep = normEndpoint(local.endpoint);
   if (ep === LEGACY_ENDPOINT) {
@@ -93,6 +98,10 @@ async function loadConfig() {
     bridge.notBefore = 0;
   }
   cfg.token = local.token || "";
+  if (!cfg.clientId) {
+    cfg.clientId = (typeof local.clientId === "string" && local.clientId) || crypto.randomUUID();
+    if (local.clientId !== cfg.clientId) await storageSet("local", { clientId: cfg.clientId }, "client id");
+  }
 }
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === "local" && (changes.endpoint || changes.token)) loadConfig();
@@ -141,7 +150,7 @@ async function probeBridge() {
   const ac = typeof AbortController === "function" ? new AbortController() : null;
   const timer = ac ? setTimeout(() => ac.abort(), BRIDGE_PROBE_TIMEOUT_MS) : null;
   try {
-    const res = await fetch(`${base}/hello`, {
+    const res = await fetch(`${base}/hello` + (cfg.clientId ? "?client=" + encodeURIComponent(cfg.clientId) : ""), {
       method: "POST",
       headers: { "X-Teleport-Client": HELLO_CLIENT },
       signal: ac ? ac.signal : undefined,
@@ -176,7 +185,7 @@ async function probeBridge() {
 }
 
 function q(path) {
-  return `${bridge.base}${path}?token=${encodeURIComponent(cfg.token)}`;
+  return `${bridge.base}${path}?token=${encodeURIComponent(cfg.token)}` + (cfg.clientId ? "&client=" + encodeURIComponent(cfg.clientId) : "");
 }
 
 // bridgeFetch is every request to the bridge except the /hello probe. A request that cannot
@@ -1015,6 +1024,32 @@ async function closeWhenPossible(target, moveId) {
   if (moveId) closingNow.delete(moveId); // ceiling hit — keep the durable entry so a later re-drive can finish it
   dbg("close GAVE UP after ~15s for " + target.type + " " + target.id + " (still open; awaiting a re-drive)");
 }
+
+// ---------------- focus report (which browser the user is in) ----------------
+// When a normal window of this profile gains focus, tell the bridge (POST /focus, the client id in
+// the query, no body), so it can deliver an incoming teleport to the browser the user is actually
+// using. A burst of focus changes (Alt+Tab cycling) sends one report, for the window focused last:
+// FOCUS_DEBOUNCE_MS is the same burst window the window-state push uses. Optional endpoint: a bridge
+// that does not know it answers 404, which is ignored.
+const FOCUS_DEBOUNCE_MS = 120;
+let focusTimer = null;
+let focusWinId = null;
+function onFocusChangedReport(windowId) {
+  const none = chrome.windows.WINDOW_ID_NONE === undefined ? -1 : chrome.windows.WINDOW_ID_NONE;
+  if (typeof windowId !== "number" || windowId === none || windowId < 0) return; // focus left the browser
+  focusWinId = windowId;
+  clearTimeout(focusTimer);
+  focusTimer = setTimeout(sendFocusReport, FOCUS_DEBOUNCE_MS);
+}
+async function sendFocusReport() {
+  focusTimer = null;
+  let w;
+  try { w = await chrome.windows.get(focusWinId); } catch (e) { return; }
+  if (!w || w.type !== "normal" || w.incognito) return;
+  if (!cfg.token) return;
+  try { bridgeFetch("/focus", { method: "POST" }).catch(() => {}); } catch (e) {}
+}
+chrome.windows.onFocusChanged.addListener(onFocusChangedReport);
 
 // ---------------- triggers ----------------
 
