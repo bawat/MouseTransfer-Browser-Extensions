@@ -63,6 +63,13 @@ through the bridge (boot, open, a refused non-http open, a malformed envelope, a
 capture and close, idle keep-alive), prints PASS/FAIL with the evidence from the bridge's
 request log, then kills the browser tree and checks nothing is left. Not part of `npm test`.
 
+`node tools/smoke-edge.mjs --go <bridgerig.exe>` runs the same checks against the **real** Go bridge,
+and `npm run integration -- <bridgerig.exe>` (`tools/integration-edge.mjs`) drives several
+extensions at once against it: two profiles (per-client delivery, focus, ack routing,
+broadcasts), a foreign extension refused by `/hello`, an older extension version (`OLD_REF=<git
+ref>`, default `80d861c`), and carry-back peek/ack. `bridgerig` lives in the wrapper repo
+(`go build -o bridgerig.exe ./testing/tools/bridgerig`). Both are opt-in and Windows + Edge only.
+
 ## Install (Chrome / Chromium, unpacked)
 
 1. Run Merged on **both** computers (`merged serve` on one, `merged connect <host>` on the
