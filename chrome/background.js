@@ -24,66 +24,176 @@ if (typeof browser !== "undefined") { globalThis.chrome = browser; }
 //   ack : { v:1, kind:"ack",  moveId }
 // The receiver opens+restores the tab and replies "ack"; the sender then closes its tab.
 
-const DEFAULT_ENDPOINT = "http://127.0.0.1:24812";
+// ---------------- the bridge's address ----------------
+//
+// The wrapper's loopback bridge moved from port 24812 to 24817 (wrapper WP-1.4,
+// internal/browserlink DefaultPort): 24812 is also the wrapper's audio port, and on Linux/BSD the
+// two could not both bind it. For one release window a Windows wrapper ALSO serves the bridge on
+// 127.0.0.1:24812; a POSIX wrapper never does (there 24812 is the audio listener, which speaks
+// TLS, so a plain-HTTP request to it fails). The wrapper's rollout matrix
+// (internal/browserlink/server.go, bridgeListenAddrs):
+//
+//   wrapper \ extension | this extension (24817, falls back to 24812) | older extension (24812 only)
+//   NEW wrapper, Windows | connects on 24817                            | connects on the 24812 legacy listener
+//   NEW wrapper, POSIX   | connects on 24817                            | (no shipped case)
+//   OLD wrapper, Windows | connects on the 24812 fallback               | connects on 24812
+//
+// So with NO user-set endpoint we try 24817 first and 24812 second. A user-set endpoint (Options)
+// is used exactly as given: never rewritten, never swapped for another port.
+const DEFAULT_ENDPOINT = "http://127.0.0.1:24817";
+const LEGACY_ENDPOINT = "http://127.0.0.1:24812";
+// The pause between two bridge probes (and the poll loop's wait after a failed one). Every switch
+// between the two ports goes through it, so two refusing ports can never become a tight loop.
+// Same value as the poll loop's existing retry pause.
+const BRIDGE_RETRY_MS = 2000;
+// A probe that gets no answer is abandoned after this long. A loopback /hello answers at once; a
+// port that accepts the connection but never answers HTTP (a TLS listener) must not hold us.
+const BRIDGE_PROBE_TIMEOUT_MS = 3000;
 
-let cfg = { endpoint: DEFAULT_ENDPOINT, token: "" };
+// cfg.endpoint is the USER's endpoint, "" when they set none (then the defaults above apply).
+let cfg = { endpoint: "", token: "" };
+
+// bridge is where requests go now. base = the endpoint that last answered /hello (or the first
+// candidate before anything has); stale = a request to base failed to connect, so the next
+// ensureBridge() re-probes; next = which candidate the next probe tries; notBefore = the earliest
+// time of the next probe; probing = the probe in flight (shared by concurrent callers).
+// Starts stale, so each worker confirms its base once before using it (a stored token says nothing
+// about which port the wrapper serves today).
+const bridge = { base: DEFAULT_ENDPOINT, stale: true, next: 0, notBefore: 0, probing: null };
+
+function bridgeCandidates() { return cfg.endpoint ? [cfg.endpoint] : [DEFAULT_ENDPOINT, LEGACY_ENDPOINT]; }
+function normEndpoint(e) { return ((e || "") + "").trim().replace(/\/+$/, ""); }
 
 // moveId -> source tabId, so an incoming ack closes exactly the tab we teleported.
 const pendingClose = new Map();
 
 // ---------------- config ----------------
 
+// loadConfig reads the user's endpoint and the token. MIGRATION: up to 2.17 every install wrote the
+// then-default endpoint (24812) into storage the first time it fetched a token, so a stored
+// LEGACY_ENDPOINT is not a user choice — it is removed, and the install behaves as "no endpoint set"
+// (24817 first, 24812 second). Any other stored value is the user's and is kept as is. A stored
+// value equal to DEFAULT_ENDPOINT is treated as "no endpoint set" too (Options saved the default).
 async function loadConfig() {
   const local = await chrome.storage.local.get(["endpoint", "token"]);
-  cfg.endpoint = (local.endpoint || DEFAULT_ENDPOINT).replace(/\/+$/, "");
+  let ep = normEndpoint(local.endpoint);
+  if (ep === LEGACY_ENDPOINT) {
+    try { await chrome.storage.local.remove("endpoint"); } catch (e) {}
+    console.log("Teleporter: forgot the stored pre-2.18 default endpoint " + LEGACY_ENDPOINT);
+    ep = "";
+  }
+  if (ep === DEFAULT_ENDPOINT) ep = "";
+  if (ep !== cfg.endpoint) {
+    cfg.endpoint = ep;
+    bridge.base = bridgeCandidates()[0];
+    bridge.next = 0;
+    bridge.stale = true;
+    bridge.notBefore = 0;
+  }
   cfg.token = local.token || "";
 }
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === "local" && (changes.endpoint || changes.token)) loadConfig();
 });
 
-// ensureToken auto-fetches the per-install token from the local Merged bridge so the user
-// never has to paste it. /hello only answers our extension (it requires the custom
-// X-Teleport-Client header, which a web page can't send without a CORS preflight the
-// bridge refuses; our host_permissions for 127.0.0.1 let us send it directly). If this
-// can't reach the bridge, the user can still set the token manually in Options.
+// ensureBridge makes sure we have a token and (with no user-set endpoint) a base that answers. It
+// auto-fetches the per-install token from the local Merged bridge so the user never has to paste
+// it. /hello only answers our extension (it requires the custom X-Teleport-Client header, which a
+// web page can't send without a CORS preflight the bridge refuses; our host_permissions for
+// 127.0.0.1 let us send it directly). If this can't reach the bridge, the user can still set the
+// token manually in Options.
 // Fixed protocol token the bridge's /hello requires (NOT the extension id — so it works
 // whether we're load-unpacked or Web-Store-published with a store-assigned id).
 const HELLO_CLIENT = "merged-tab-teleporter";
 // When this worker started — used to ignore a stale "reload" right after we just reloaded
 // (prevents a reload loop if the command is redelivered to the fresh worker).
 const STARTED_AT = Date.now();
-async function ensureToken() {
-  if (cfg.token) return true;
+function bridgeNeedsProbe() { return !cfg.token || (!cfg.endpoint && bridge.stale); }
+// ensureBridge probes at most ONE candidate per call and at most one per BRIDGE_RETRY_MS overall;
+// it returns false at once while that pause is running. Concurrent callers share one probe.
+// With {tryAll: true} (boot) it keeps going — pausing BRIDGE_RETRY_MS between probes — until every
+// candidate has had one try, so a worker that boots against an old wrapper reaches 24812 before it
+// asks the bridge anything else.
+async function ensureBridge(opts) {
+  const tries = opts && opts.tryAll ? bridgeCandidates().length : 1;
+  for (let i = 0; i < tries; i++) {
+    if (!bridgeNeedsProbe()) return true;
+    if (!bridge.probing) {
+      const wait = bridge.notBefore - Date.now();
+      if (wait > 0) {
+        if (!(opts && opts.tryAll)) return false;
+        await sleep(wait);
+        if (!bridgeNeedsProbe()) return true;
+      }
+    }
+    if (!bridge.probing) bridge.probing = probeBridge().finally(() => { bridge.probing = null; });
+    if (await bridge.probing) return true;
+  }
+  return !bridgeNeedsProbe();
+}
+async function probeBridge() {
+  const cands = bridgeCandidates();
+  const idx = bridge.next % cands.length;
+  const base = cands[idx];
+  let token = "";
+  const ac = typeof AbortController === "function" ? new AbortController() : null;
+  const timer = ac ? setTimeout(() => ac.abort(), BRIDGE_PROBE_TIMEOUT_MS) : null;
   try {
-    const res = await fetch(`${cfg.endpoint}/hello`, {
+    const res = await fetch(`${base}/hello`, {
       method: "POST",
       headers: { "X-Teleport-Client": HELLO_CLIENT },
+      signal: ac ? ac.signal : undefined,
     });
     if (res.ok) {
       const j = await res.json();
-      if (j && j.token) {
-        cfg.token = j.token;
-        await chrome.storage.local.set({ token: j.token, endpoint: cfg.endpoint });
-        console.log("Teleporter: auto-configured from the Merged bridge");
-        return true;
-      }
+      if (j && j.token) token = String(j.token);
     }
-  } catch (e) { /* bridge not up yet; pollLoop will retry via ensureToken */ }
-  return false;
+  } catch (e) { /* refused, timed out, or not the bridge (e.g. the TLS audio port) */ }
+  if (timer) clearTimeout(timer);
+  if (!token) {
+    // Not the bridge (or not up yet): the next probe tries the next candidate, after the pause.
+    bridge.next = (idx + 1) % cands.length;
+    bridge.notBefore = Date.now() + BRIDGE_RETRY_MS;
+    return false;
+  }
+  const moved = bridge.base !== base;
+  bridge.base = base;
+  bridge.stale = false;
+  bridge.next = 0; // a later re-probe starts again from the preferred port
+  if (!cfg.token) {
+    cfg.token = token;
+    await chrome.storage.local.set({ token }); // the token only: storing the endpoint is what pinned old installs to 24812
+    console.log("Teleporter: auto-configured from the Merged bridge at " + base);
+  }
+  if (moved || base !== cands[0]) dbg("bridge: using " + base + (base === LEGACY_ENDPOINT ? " (legacy port — an older wrapper)" : ""));
+  return true;
 }
 
 function q(path) {
-  return `${cfg.endpoint}${path}?token=${encodeURIComponent(cfg.token)}`;
+  return `${bridge.base}${path}?token=${encodeURIComponent(cfg.token)}`;
+}
+
+// bridgeFetch is every request to the bridge except the /hello probe. A request that cannot
+// CONNECT (fetch rejects) marks the base stale, so the next ensureBridge() — the poll loop calls
+// it every turn — finds the port that answers now. An HTTP error status is an answer from the
+// bridge and changes nothing. A user-set endpoint is never re-probed (there is nothing else to try).
+// The fetch starts synchronously, before the first await (sendCarryback relies on that).
+async function bridgeFetch(path, init, extraQuery) {
+  try {
+    return await fetch(q(path) + (extraQuery || ""), init);
+  } catch (e) {
+    if (!cfg.endpoint) bridge.stale = true;
+    throw e;
+  }
 }
 
 // ---------------- transport ----------------
 
 async function sendEnvelope(env) {
-  if (!cfg.token) await ensureToken();
+  if (bridgeNeedsProbe()) await ensureBridge();
   if (!cfg.token) { console.warn("Teleporter: no token (is merged running?)"); return false; }
   try {
-    const res = await fetch(q("/send"), {
+    const res = await bridgeFetch("/send", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(env),
@@ -104,10 +214,10 @@ async function pollLoop() {
   if (polling) return;
   polling = true;
   for (;;) {
-    if (!cfg.token) { await ensureToken(); if (!cfg.token) { await sleep(2000); continue; } }
+    if (bridgeNeedsProbe() && !(await ensureBridge())) { await sleep(BRIDGE_RETRY_MS); continue; }
     try {
       const askedAt = Date.now();
-      const res = await fetch(q("/events"));
+      const res = await bridgeFetch("/events");
       if (res.status === 200) {
         const env = await res.json();
         await handleEnvelope(env);
@@ -399,7 +509,7 @@ async function closeStrayBlankWindows(keepWinId) {
 // (create a fresh window) if the bridge can't be reached.
 async function wasColdLaunch() {
   try {
-    const res = await fetch(q("/coldlaunch"));
+    const res = await bridgeFetch("/coldlaunch");
     if (res.ok) { const j = await res.json(); return !!(j && j.cold); }
   } catch (e) { /* bridge unreachable — treat as not a cold launch */ }
   return false;
@@ -465,7 +575,7 @@ async function reportTeleportWindow(winId) {
   try {
     const w = await chrome.windows.get(winId);
     if (w && typeof w.left === "number") {
-      fetch(q("/teleport-window") + "&left=" + Math.round(w.left) + "&top=" + Math.round(w.top) +
+      bridgeFetch("/teleport-window", undefined, "&left=" + Math.round(w.left) + "&top=" + Math.round(w.top) +
         "&width=" + Math.round(w.width) + "&height=" + Math.round(w.height)).catch(() => {});
     }
   } catch (e) { /* best-effort */ }
@@ -474,7 +584,7 @@ async function reportTeleportWindow(winId) {
 // dbg surfaces a diagnostic line into the wrapper's btrace log (POST /debug) so we can see the
 // extension's own view of the windows from a remote machine. Best-effort; the wrapper logs it only when
 // its browser-teleport trace toggle is on.
-function dbg(m) { try { fetch(q("/debug"), { method: "POST", body: String(m) }).catch(() => {}); } catch (e) {} }
+function dbg(m) { try { bridgeFetch("/debug", { method: "POST", body: String(m) }).catch(() => {}); } catch (e) {} }
 
 // winSummary renders the current normal windows + tab counts + first URLs for a dbg line.
 async function winSummary() {
@@ -761,7 +871,7 @@ function resolveProfileRole() {
   if (roleInFlight) return roleInFlight;
   roleInFlight = (async () => {
     try { const s = await chrome.storage.session.get("mtRole"); if (s && s.mtRole) { PROFILE_ROLE = s.mtRole; return PROFILE_ROLE; } } catch (e) {}
-    try { const res = await fetch(q("/profile-role")); PROFILE_ROLE = (res.ok && (await res.json()).role) || "normal"; }
+    try { const res = await bridgeFetch("/profile-role"); PROFILE_ROLE = (res.ok && (await res.json()).role) || "normal"; }
     catch (e) { PROFILE_ROLE = "normal"; }
     await persistRole();
     dbg("profile role = " + PROFILE_ROLE);
@@ -808,9 +918,9 @@ async function emitWinState() {
   const windows = wins.map((w) => ({ l: w.left | 0, t: w.top | 0, w: w.width | 0, h: w.height | 0,
     tabs: (w.tabs ? w.tabs.length : 0) }));
   try {
-    if (!cfg.token) await ensureToken();
+    if (bridgeNeedsProbe()) await ensureBridge();
     if (!cfg.token) return;
-    await fetch(q("/winstate"), { method: "POST", headers: { "Content-Type": "application/json" },
+    await bridgeFetch("/winstate", { method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ windows }) });
   } catch (e) {}
 }
@@ -872,7 +982,7 @@ function sendCarryback(tabs, windowId) {
   if (typeof navigator !== "undefined" && typeof navigator.sendBeacon === "function") {
     try { beacon = navigator.sendBeacon(url, body); } catch (e) {} // false = the beacon was not queued
   }
-  if (!beacon) { try { fetch(url, { method: "POST", body, keepalive: true }).catch(() => {}); } catch (e) {} }
+  if (!beacon) { try { bridgeFetch("/carryback", { method: "POST", body, keepalive: true }).catch(() => {}); } catch (e) {} }
   dbg("carryback: queued closed window " + windowId + " (" + tabs.length + " tabs, via " + (beacon ? "sendBeacon" : "keepalive fetch") + ")");
 }
 
@@ -894,7 +1004,7 @@ async function stageCarryback() {
   // real startup instead (restoreCarryback's direct path).
   if (!(chrome.bookmarks && chrome.bookmarks.create)) { dbg("carryback: bookmarks API unavailable — leaving queue staged in the wrapper"); return; }
   let pending = [];
-  try { const res = await fetch(q("/carryback-drain")); pending = (res.ok && (await res.json()).windows) || []; } catch (e) { return; }
+  try { const res = await bridgeFetch("/carryback-drain"); pending = (res.ok && (await res.json()).windows) || []; } catch (e) { return; }
   if (!pending.length) return;
   const folder = await ensureCarrybackFolder(); if (!folder) return;
   for (const win of pending) {
@@ -939,7 +1049,7 @@ async function restoreCarryback() {
 // so the mid-session-window-popping hazard the bookmark staging guards against cannot occur here.
 async function openCarrybackDirect() {
   let pending = [];
-  try { const res = await fetch(q("/carryback-drain")); pending = (res.ok && (await res.json()).windows) || []; } catch (e) { return; }
+  try { const res = await bridgeFetch("/carryback-drain"); pending = (res.ok && (await res.json()).windows) || []; } catch (e) { return; }
   if (!pending.length) return;
   let opened = 0;
   for (const win of pending) {
@@ -966,14 +1076,14 @@ chrome.runtime.onStartup.addListener(async () => { await boot(); if (PROFILE_ROL
 chrome.runtime.onInstalled.addListener(() => boot());
 
 // boot() runs at most ONCE per worker (single-flight): it's called from the bare invocation below AND
-// onStartup AND onInstalled, which would otherwise run loadConfig/ensureToken/resolveProfileRole/pollLoop
+// onStartup AND onInstalled, which would otherwise run loadConfig/ensureBridge/resolveProfileRole/pollLoop
 // concurrently and race (notably the one-shot /profile-role query — see resolveProfileRole).
 let bootPromise = null;
 function boot() { if (!bootPromise) bootPromise = doBoot(); return bootPromise; }
 async function doBoot() {
   startKeepAlive();
   await loadConfig();
-  await ensureToken();
+  await ensureBridge({ tryAll: true }); // reach 24812 (an older wrapper) before asking for the profile role
   await resolveProfileRole();
   await initWinTabs();
   recheckCloses("boot"); // a resurrected worker finishes any acked close it lost mid-retry

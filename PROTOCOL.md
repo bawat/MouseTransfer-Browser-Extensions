@@ -22,7 +22,20 @@ only the manifest and packaging differ.
 
 ## The loopback bridge
 
-Merged listens on `http://127.0.0.1:24812` (loopback only). The extension fetches its
+Merged listens on `http://127.0.0.1:24817` (loopback only). It used to listen on `24812`,
+which is also its audio port; for one release window a Windows Merged still serves the bridge
+on `127.0.0.1:24812` too, and a Linux/BSD Merged never does (there `24812` is the TLS audio
+listener). So an extension with no endpoint configured tries `24817` first and `24812` second,
+with a pause between attempts, and treats anything that does not answer `/hello` with a token
+as "not the bridge". An endpoint the user sets in the options is used as is, with no fallback.
+
+| Merged \ extension | 2.18+ (24817, then 24812) | before 2.18 (24812 only) |
+|---|---|---|
+| new, Windows | 24817 | 24812 (legacy listener) |
+| new, Linux/BSD | 24817 | — |
+| old, Windows | 24812 (fallback) | 24812 |
+
+The extension fetches its
 per-install token automatically from `POST /hello` (it sends a fixed `X-Teleport-Client:
 merged-tab-teleporter` header, which a web page can't send — the CORS preflight is refused —
 so only an extension with `127.0.0.1` host access can get the token). No manual paste; the

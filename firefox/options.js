@@ -2,7 +2,9 @@
 const $ = (id) => document.getElementById(id);
 
 chrome.storage.local.get(["endpoint", "token"], (r) => {
-  $("endpoint").value = r.endpoint || "http://127.0.0.1:24812";
+  // Empty = the default (the placeholder): the extension then tries the bridge on 24817 and, for an
+  // older wrapper, 24812. Only a value typed here is a user endpoint (used as is, no fallback).
+  $("endpoint").value = r.endpoint || "";
   $("token").value = r.token || "";
 });
 

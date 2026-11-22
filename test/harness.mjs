@@ -26,6 +26,10 @@ export const BACKGROUND_SRC = path.join(ROOT, "src", "background.js");
 
 // ---------------- fake clock + timers ----------------
 
+// More timers than this firing at one instant means the code is looping without pausing. The
+// extension sets a handful of timers per event at most, so any real burst is far below it.
+const TIGHT_LOOP_TIMERS = 200;
+
 class Clock {
   constructor(start) { this.now = start; this.timers = []; this.seq = 0; }
   setTimeout(fn, ms, ...args) {
@@ -305,7 +309,17 @@ export async function loadBackground(opts = {}) {
     const req = { url: String(url), path: u.pathname, port: u.port, host: u.host, origin: u.origin, search: u.search,
       method: (init.method || "GET").toUpperCase(), headers: init.headers || {}, body: init.body, opts: init, at: clock.now };
     requests.push(req);
-    try { return Promise.resolve(route(req)); } catch (e) { return Promise.reject(e); }
+    let p;
+    try { p = Promise.resolve(route(req)); } catch (e) { p = Promise.reject(e); }
+    // Honour an AbortSignal like a real fetch: an abort rejects with an AbortError (a held request
+    // otherwise stays pending forever).
+    const sig = init.signal;
+    if (sig) {
+      const abortErr = () => Object.assign(new Error("The operation was aborted."), { name: "AbortError" });
+      if (sig.aborted) return Promise.reject(abortErr());
+      p = Promise.race([p, new Promise((_, rej) => sig.addEventListener("abort", () => { req.aborted = true; rej(abortErr()); }, { once: true }))]);
+    }
+    return p;
   };
 
   class FakeDate extends Date {
@@ -341,12 +355,18 @@ export async function loadBackground(opts = {}) {
     get: (expr) => vm.runInContext(expr, ctx),
     flush,
     // tick advances fake time by ms, firing due timers in time order and flushing promises between.
+    // A run of timers that never lets time advance is a TIGHT LOOP in the code under test (e.g. a
+    // retry with no pause): tick() fails loudly instead of spinning forever.
     async tick(ms) {
       const end = clock.now + ms;
+      let sameTime = 0, lastAt = -1;
       await flush();
       for (;;) {
         const t = clock.next(end);
         if (!t) break;
+        sameTime = t.at === lastAt ? sameTime + 1 : 0;
+        lastAt = t.at;
+        if (sameTime > TIGHT_LOOP_TIMERS) throw new Error(`tight loop: more than ${TIGHT_LOOP_TIMERS} timers fired at t=${t.at} without time advancing`);
         clock.now = t.at;
         if (t.every) t.at += t.every; else clock.clear(t.id);
         try { t.fn(...t.args); } catch (e) { logs.push(["timer-threw", String(e)]); }
