@@ -148,12 +148,12 @@ function makeWorld(init) {
   for (const win of (init || [])) {
     const id = win.id ?? w.nextId++;
     w.windows.push({ left: 0, top: 0, width: 800, height: 600, type: "normal", focused: false, ...win, id,
-      tabs: (win.tabs || []).map((t) => ({ active: false, ...t, id: t.id ?? w.nextId++, windowId: id })) });
+      tabs: (win.tabs || []).map((t) => ({ active: false, status: "complete", ...t, id: t.id ?? w.nextId++, windowId: id })) });
   }
   return w;
 }
 
-function makeChrome(opts, record, world) {
+function makeChrome(opts, record, world, tools) {
   const ev = (name) => makeEvent(name, null);
   const storageChanged = ev("storage.onChanged");
   const winView = (win, populate) => {
@@ -210,8 +210,8 @@ function makeChrome(opts, record, world) {
     },
     scripting: {
       executeScript: (inj) => {
-        record("scripting.executeScript", { tabId: inj.target && inj.target.tabId, func: inj.func && inj.func.name, args: inj.args });
-        const r = opts.executeScript ? opts.executeScript(inj) : [{ result: undefined }];
+        record("scripting.executeScript", { tabId: inj.target && inj.target.tabId, allFrames: !!(inj.target && inj.target.allFrames), func: inj.func && inj.func.name, args: inj.args });
+        const r = opts.executeScript ? opts.executeScript(inj, tools) : [{ frameId: 0, result: undefined }];
         return Promise.resolve(r);
       },
     },
@@ -236,7 +236,7 @@ function makeChrome(opts, record, world) {
         const id = world.nextId++;
         const urls = props && props.url ? (Array.isArray(props.url) ? props.url : [props.url]) : ["chrome://newtab/"];
         const win = { id, left: 0, top: 0, width: 800, height: 600, type: "normal", focused: !!(props && props.focused),
-          tabs: urls.map((u, i) => ({ id: world.nextId++, url: u, active: i === 0, windowId: id })) };
+          tabs: urls.map((u, i) => ({ id: world.nextId++, url: u, active: i === 0, status: "loading", windowId: id })) };
         world.windows.push(win);
         return Promise.resolve(winView(win, true));
       },
@@ -260,7 +260,7 @@ function makeChrome(opts, record, world) {
         if (opts.tabsCreate) { const r = opts.tabsCreate(props); if (r) return r; }
         let win = props && props.windowId != null ? findWin(props.windowId) : (world.windows.find((y) => y.focused) || world.windows[0]);
         if (!win) { win = { id: world.nextId++, left: 0, top: 0, width: 800, height: 600, type: "normal", focused: true, tabs: [] }; world.windows.push(win); }
-        const t = { id: world.nextId++, url: props && props.url, active: !!(props && props.active), windowId: win.id };
+        const t = { id: world.nextId++, url: props && props.url, active: !!(props && props.active), status: "loading", windowId: win.id };
         win.tabs.push(t);
         return Promise.resolve({ ...t });
       },
@@ -299,6 +299,7 @@ function makeChrome(opts, record, world) {
 //   navigator: {...}                         the context's navigator (default: {} = a service worker
 //                                            without sendBeacon, as measured in Chromium)
 //   tabsCreate / windowsCreate / tabsRemove: (args) => Promise|undefined   override one call
+//   executeScript: (injection, tools) => results|Promise   (tools.delay(ms, v) uses the fake clock)
 //   omitApis: ["bookmarks", "tabs.move"]     remove APIs to model an engine without them
 //   storageHook: (area, op, arg) => Error|undefined   make a storage call reject
 //   start: <ms>                              initial fake time
@@ -308,7 +309,9 @@ export async function loadBackground(opts = {}) {
   const record = (api, ...args) => calls.push({ api, args: deepCopy(args) });
   const clock = new Clock(opts.start ?? 1_700_000_000_000);
   const world = makeWorld(opts.windows);
-  const chrome = makeChrome(opts, record, world);
+  // tools handed to hooks: delay(ms, value) resolves on the FAKE clock.
+  const tools = { delay: (ms, v) => new Promise((r) => clock.setTimeout(() => r(v), ms)), clock };
+  const chrome = makeChrome(opts, record, world, tools);
   const requests = [];
   const route = opts.fetch || defaultRoute;
 

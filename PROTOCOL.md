@@ -75,8 +75,16 @@ Merged does not parse these — both extensions must agree on them. Always inclu
   restores what it can and ignores the rest. `active` marks the tab to focus.
 - A receiver opens **only** `http:`/`https:` URLs (checked with a real URL parse) and drops
   every other entry. If no tab survives, it does not ack, so the sender keeps its tab(s).
-- `videoTime` — seconds into the first `<video>`. (Chrome also bakes YouTube time into
-  the URL via `&t=Ns` since that restores most reliably.)
+- `videoTime` — seconds into the tab's video: a playing `<video>` if there is one, searched in
+  every frame of the page. (When that video is in the top frame of a YouTube page, the sender
+  also bakes the time into the URL via `&t=Ns`, since that restores most reliably.)
+- `videoFrame` — *optional, since 2.19.* Present when the video was found in an embedded frame
+  (an `<iframe>` player): that frame's URL **without query or fragment**
+  (`origin + pathname`, e.g. `https://www.youtube-nocookie.com/embed/ID`). A receiver seeks
+  only a frame whose URL matches it, so a video in another frame (an advert) is never touched.
+  Absent: seek the top frame's first `<video>`, as before. Receivers that predate it ignore it
+  (and so does Merged's extensionless receive path, which reads only `moveId`, `asWindow` and
+  `tabs[].url`).
 
 ### `capture-window` — (Merged → its LOCAL extension only)
 

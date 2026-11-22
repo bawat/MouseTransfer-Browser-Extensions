@@ -291,25 +291,70 @@ function bakeYouTubeTime(url, seconds) {
   return url + (url.includes("?") ? "&" : "?") + `t=${Math.floor(seconds)}s` + frag;
 }
 
-// Injected into the page to read restorable state.
+// A frame is named across machines by its URL without query or fragment (origin + pathname: an
+// embedded player's own page, e.g. https://www.youtube-nocookie.com/embed/ID). readPageState and
+// restorePageState each compute it themselves: they run inside the PAGE, where nothing from this
+// file is in scope.
+
+// Injected into EVERY frame of the tab (allFrames) to read restorable state. Runs in the page.
+// The video reported for a frame is a PLAYING one if there is one (an advert that has stopped
+// loses to the film), else the first with a position.
 function readPageState() {
-  let videoTime = 0;
-  try { const v = document.querySelector("video"); if (v && v.currentTime > 0) videoTime = v.currentTime; } catch (e) {}
-  return { scrollX: window.scrollX || 0, scrollY: window.scrollY || 0, videoTime };
+  let video = null;
+  try {
+    for (const v of document.querySelectorAll("video")) {
+      if (!(v.currentTime > 0)) continue;
+      if (!video || (video.paused && !v.paused)) video = { time: v.currentTime, paused: v.paused };
+    }
+  } catch (e) {}
+  let frame = "";
+  try { frame = location.origin + location.pathname; } catch (e) {}
+  return { top: window === window.top, frame, scrollX: window.scrollX || 0, scrollY: window.scrollY || 0, video };
 }
 
-// captureTab snapshots one tab into a transferable payload (url + restore hints), or null
-// for a non-http(s) tab (e.g. chrome://, where we can't inject and that wouldn't restore).
+// CAPTURE_INJECT_TIMEOUT_MS bounds the wait for one tab's state. The injected function is trivial,
+// so a tab that has not answered by then is hung, busy or still loading (executeScript waits for
+// the document to be ready), and the tab goes as URL-only. 1 s is half of the wrapper's 2 s grace
+// before it starts force-closing a teleported-away source window on close-confirm browsers
+// (cmd/filedrag_windows.go watchDoomedSourceClose), so a capture that hits the timeout still has
+// time to be sent. Tabs are captured concurrently, so this is also the bound for a whole window.
+const CAPTURE_INJECT_TIMEOUT_MS = 1000;
+
+function withTimeout(promise, ms, what) {
+  let timer = null;
+  return Promise.race([
+    promise,
+    new Promise((_, rej) => { timer = setTimeout(() => rej(new Error(what + ": no answer within " + ms + " ms")), ms); }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+// captureTab snapshots one tab into a transferable payload (url + restore hints), or null for a
+// non-http(s) tab (e.g. chrome://, where we can't inject and that wouldn't restore). Any failure to
+// read the page — refused injection, timeout, a discarded tab — still sends the URL.
+// A DISCARDED tab is not injected at all: measured 2026-11-22 (headless Edge 125 probe), executeScript
+// on a discarded tab rejects at once ("Cannot access contents of the page") without reloading it,
+// so asking would only add a failed call; other engines were not measured, and skipping covers them.
 async function captureTab(tab) {
-  if (!tab || !tab.url || !/^https?:/i.test(tab.url)) return null;
-  let state = { scrollX: 0, scrollY: 0, videoTime: 0 };
-  try {
-    const out = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: readPageState });
-    if (out && out[0] && out[0].result) state = out[0].result;
-  } catch (e) { /* restricted/unloaded tab; carry just the url */ }
+  if (!tab || !isWebUrl(tab.url)) return null;
+  let frames = [];
+  if (!tab.discarded) {
+    try {
+      const out = await withTimeout(
+        chrome.scripting.executeScript({ target: { tabId: tab.id, allFrames: true }, func: readPageState }),
+        CAPTURE_INJECT_TIMEOUT_MS, "capture tab " + tab.id);
+      if (Array.isArray(out)) frames = out.filter((r) => r && r.result).map((r) => Object.assign({}, r.result, { top: r.frameId === 0 || !!r.result.top }));
+    } catch (e) { dbg("capture: tab " + tab.id + " sent as URL only (" + (e && e.message ? e.message : e) + ")"); }
+  }
+  const top = frames.find((f) => f.top) || { scrollX: 0, scrollY: 0 };
+  // The video to carry: a playing one beats a paused one, and the top frame wins a tie.
+  const vids = frames.filter((f) => f.video);
+  const vf = vids.find((f) => !f.video.paused && f.top) || vids.find((f) => !f.video.paused) || vids.find((f) => f.top) || vids[0] || null;
+  const videoTime = vf ? vf.video.time : 0;
   let url = tab.url;
-  if (state.videoTime > 0 && isYouTube(url)) url = bakeYouTubeTime(url, state.videoTime);
-  return { url, active: !!tab.active, scrollX: state.scrollX, scrollY: state.scrollY, videoTime: state.videoTime };
+  if (videoTime > 0 && vf.top && isYouTube(url)) url = bakeYouTubeTime(url, videoTime);
+  const out = { url, active: !!tab.active, scrollX: top.scrollX || 0, scrollY: top.scrollY || 0, videoTime };
+  if (vf && !vf.top && vf.frame) out.videoFrame = vf.frame; // absent = the video is in the top frame
+  return out;
 }
 
 // ---- durable pending-close registry ----
@@ -463,11 +508,9 @@ async function teleportFocusedWindow(env) {
   const win = await findWindowByPxRect(env.wl, env.wt, env.ww, env.wh);
   if (!win) { dbg("capture-window: ABORTING teleport — dragged window not found (drag reverted/closed?)"); return; }
   if (!win.tabs || !win.tabs.length) return;
-  const tabs = [];
-  for (const tab of win.tabs) {
-    const t = await captureTab(tab);
-    if (t) tabs.push(t);
-  }
+  // All tabs at once (each bounded by CAPTURE_INJECT_TIMEOUT_MS); Promise.all keeps the window's
+  // tab order in the envelope.
+  const tabs = (await Promise.all(win.tabs.map((tab) => captureTab(tab)))).filter(Boolean);
   if (!tabs.length) { console.warn("Teleporter: no http(s) tabs in the dragged window"); return; }
   const moveId = crypto.randomUUID();
   pendingClose.set(moveId, { type: "window", id: win.id });
@@ -479,28 +522,67 @@ async function teleportFocusedWindow(env) {
 
 // ---------------- receive (peer -> this machine) ----------------
 
-// Injected after the teleported tab loads, to restore scroll/video position.
+// RESTORE_SCROLL_WINDOW_MS bounds how long the restore keeps re-applying the scroll position. A
+// page built by script is often still growing when it reports "complete", so a single scrollTo is
+// clamped short of the target; re-trying every RESTORE_SCROLL_STEP_MS until the position is reached
+// (or this window ends) lands it. Chosen, not sourced: no standard says how long a page keeps
+// growing; 3 s covers a page's own post-load rendering without fighting the user for long.
+const RESTORE_SCROLL_WINDOW_MS = 3000;
+const RESTORE_SCROLL_STEP_MS = 100;
+
+// Injected into EVERY frame of the new tab (allFrames) once it has loaded. Runs in the page.
+// Video: with state.videoFrame (the sender found the video in an embedded frame) only a frame whose
+// URL minus query/fragment equals it seeks — an advert in another frame is never touched; without
+// it (the video was in the top frame, or an older sender) only the top frame seeks, as before.
+// Scroll: top frame only, re-applied until reached or the window ends.
 function restorePageState(state) {
+  const isTop = window === window.top;
   try {
-    if (state.scrollX || state.scrollY) window.scrollTo(state.scrollX || 0, state.scrollY || 0);
     if (state.videoTime > 0) {
-      const v = document.querySelector("video");
-      if (v) { try { v.currentTime = state.videoTime; } catch (e) {} }
+      let frame = "";
+      try { frame = location.origin + location.pathname; } catch (e) {}
+      const mine = state.videoFrame ? (!isTop && frame === state.videoFrame) : isTop;
+      if (mine) {
+        const v = document.querySelector("video");
+        if (v) { try { v.currentTime = state.videoTime; } catch (e) {} }
+      }
     }
   } catch (e) {}
+  if (!isTop || !(state.scrollX || state.scrollY)) return;
+  const x = state.scrollX || 0, y = state.scrollY || 0;
+  const deadline = Date.now() + (state.windowMs || 0);
+  return new Promise((resolve) => {
+    const step = () => {
+      try { window.scrollTo(x, y); } catch (e) { resolve(false); return; }
+      if ((Math.abs((window.scrollX || 0) - x) <= 1 && Math.abs((window.scrollY || 0) - y) <= 1)) { resolve(true); return; }
+      if (Date.now() >= deadline) { resolve(false); return; }
+      setTimeout(step, state.stepMs || 100);
+    };
+    step();
+  });
 }
 
-// scheduleRestore re-applies a tab's scroll/video state once it finishes loading,
-// independently of the ack (so the source side never waits on it).
+// scheduleRestore re-applies a tab's scroll/video state once it has loaded, independently of the
+// ack (so the source side never waits on it). It listens for "complete" AND checks the tab's
+// current status, because a tab that is already complete (an adopted cold-launch tab, a fast page)
+// sends no further "complete" — listening alone missed it. The listener goes first so a "complete"
+// landing between the two cannot fall through the gap; the restore runs once either way.
 function scheduleRestore(tabId, t) {
   if (!tabId || !(t.scrollX || t.scrollY || t.videoTime)) return;
-  const onUpdated = (id, info) => {
-    if (id !== tabId || info.status !== "complete") return;
+  let done = false;
+  const run = () => {
+    if (done) return;
+    done = true;
     chrome.tabs.onUpdated.removeListener(onUpdated);
-    chrome.scripting.executeScript({ target: { tabId: id }, func: restorePageState, args: [{ scrollX: t.scrollX || 0, scrollY: t.scrollY || 0, videoTime: t.videoTime || 0 }] }).catch(() => {});
+    clearTimeout(stop);
+    const state = { scrollX: t.scrollX || 0, scrollY: t.scrollY || 0, videoTime: t.videoTime || 0,
+      videoFrame: typeof t.videoFrame === "string" ? t.videoFrame : "", windowMs: RESTORE_SCROLL_WINDOW_MS, stepMs: RESTORE_SCROLL_STEP_MS };
+    chrome.scripting.executeScript({ target: { tabId, allFrames: true }, func: restorePageState, args: [state] }).catch(() => {});
   };
+  const onUpdated = (id, info) => { if (id === tabId && info.status === "complete") run(); };
   chrome.tabs.onUpdated.addListener(onUpdated);
-  setTimeout(() => chrome.tabs.onUpdated.removeListener(onUpdated), 20000); // stop listening eventually
+  const stop = setTimeout(() => chrome.tabs.onUpdated.removeListener(onUpdated), 20000); // stop listening eventually
+  chrome.tabs.get(tabId).then((tab) => { if (tab && tab.status === "complete" && isWebUrl(tab.url)) run(); }, () => {});
 }
 
 // isWebUrl reports whether u parses as an absolute http: or https: URL (a real parse, so
