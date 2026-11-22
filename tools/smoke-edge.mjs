@@ -91,7 +91,11 @@ swap(/const LEGACY_ENDPOINT = "http:\/\/127\.0\.0\.1:24812";/, `const LEGACY_END
 fs.writeFileSync(bgPath, bg);
 // Code only: drop whole-line comments and trailing " // ..." comments before looking.
 const leftovers = bg.split("\n").map((l) => (l.trim().startsWith("//") ? "" : l.replace(/\s\/\/\s.*$/, ""))).filter((l) => /2481[27]/.test(l));
-if (leftovers.length) throw new Error("the copy still names a real bridge port in code:\n" + leftovers.join("\n"));
+if (leftovers.length) {
+  fs.rmSync(tmp, { recursive: true, force: true });
+  console.error("smoke-edge: the copy still names a real bridge port in code — not launching:\n" + leftovers.join("\n"));
+  process.exit(2);
+}
 console.log("extension copy: " + extDir + " (both endpoints -> " + BASE + ")");
 
 // ---------------- browser ----------------
