@@ -18,7 +18,8 @@ loopback bridge. You never touch Go or the network between machines.
 
 A new engine is a JS-only PR. The JS is identical across builds (a one-line shim at the top
 of `background.js` points `chrome.*` at the promise-based `browser.*` on Firefox/Safari);
-only the manifest and packaging differ.
+only the manifest and packaging differ. The three folders are generated from `src/` by
+`node tools/build.mjs` — edit `src/`, never the folders (see the README).
 
 ## The loopback bridge
 

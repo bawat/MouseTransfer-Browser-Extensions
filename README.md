@@ -21,6 +21,40 @@ Three engine builds cover the top browsers — see [BROWSERS.md](BROWSERS.md) fo
 per-browser mapping and per-store submission notes. Adding another engine is a JS-only PR
 against [PROTOCOL.md](PROTOCOL.md).
 
+## Editing: `src/` is the source, the browser folders are generated
+
+`chrome/`, `firefox/` and `safari/` are **build output**. Edit only `src/`:
+
+| In `src/` | What it is |
+|---|---|
+| `background.js` | the whole extension logic, shared by every engine |
+| `options.html`, `options.js`, `icon*.png` | the options page and icons, shared |
+| `manifest.base.json` | the manifest every engine shares — **the one version number** lives here |
+| `manifest.chrome.json`, `manifest.firefox.json`, `manifest.safari.json` | per-engine overrides, merged over the base |
+
+An override replaces a value, deletes a key with `null`, and removes array elements with
+`{"$remove": [...]}` (Firefox swaps `background.service_worker` for `background.scripts`;
+Safari drops the `bookmarks` permission). Behaviour that differs per engine goes in
+`background.js` as a runtime feature check (as it already does for `tabs.move` and
+`bookmarks`), never in a per-engine copy.
+
+After editing (Node 18+, no `npm install` needed — there are no dependencies):
+
+```sh
+node tools/build.mjs          # regenerate chrome/, firefox/, safari/   (npm run build)
+npm test                      # node --test test/*.test.mjs — includes the --check below
+node tools/build.mjs --check  # fails, naming the file, if a generated folder differs from src/
+```
+
+Commit `src/` **and** the regenerated folders together: the folders stay in git so the
+extension can be loaded unpacked straight from the repo with no build step. Each generated
+`background.js` starts with a "GENERATED" header. The build only writes the files it
+generates (it never deletes, so `safari/README.md` is safe). Bump `version` in
+`src/manifest.base.json` for a release.
+
+`test/harness.mjs` runs the real `src/background.js` in Node with a fake `chrome`, `fetch`
+and clock, so behaviour can be tested without a browser.
+
 ## Install (Chrome / Chromium, unpacked)
 
 1. Run Merged on **both** computers (`merged serve` on one, `merged connect <host>` on the

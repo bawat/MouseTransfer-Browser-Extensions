@@ -1,7 +1,9 @@
 # Safari (WebKit) build
 
-This folder holds the standard Web Extension source for Safari. The JS is the same
-`background.js` as the other builds (a shim at the top points `chrome.*` at the promise-based
+This folder holds the standard Web Extension for Safari. Everything in it except this README is
+**generated** from `../src/` by `node tools/build.mjs` (run from the repo root) — edit `src/`,
+not this folder; the Safari-specific manifest keys are in `src/manifest.safari.json`. The JS is
+the same `background.js` as the other builds (a shim at the top points `chrome.*` at the promise-based
 `browser.*`; on Safari that's a harmless normalization — Apple: "Safari web extensions support
 both the `chrome.*` and `browser.*` namespaces" and "both the callback and `Promise` approaches
 for asynchronous APIs" —
@@ -43,7 +45,8 @@ For distribution, a Safari web extension must be wrapped in a native macOS/iOS a
    ```
    The tool "used to be named `safari-web-extension-converter`" (same doc) — older Xcodes ship
    it under that name with the same arguments. Notes: without `--copy-resources` the project
-   *references* this folder (edits here flow into the packaged extension — handy for dev);
+   *references* this folder (a rebuild with `node tools/build.mjs` flows into the packaged
+extension — handy for dev);
    `--rebuild-project` re-runs on an existing project (e.g. to add iOS later); `--swift`/`--objc`
    pick the app language; `--no-open`, `--no-prompt`, `--force` for scripting.
 2. Open the generated `.xcodeproj`, select the macOS app scheme, and **Product > Run** — "as

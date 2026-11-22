@@ -10,7 +10,9 @@ engine families** to target, which between them cover the top desktop browsers:
 | [`safari/`](safari/) | WebKit | Safari (macOS + iOS) — built via Xcode, see [safari/README.md](safari/README.md) |
 
 The runtime protocol ([PROTOCOL.md](PROTOCOL.md)) is identical across all of them; only the
-manifest and packaging differ per engine.
+manifest and packaging differ per engine. All three folders are generated from `src/` by
+`node tools/build.mjs` (see the [README](README.md)); they are committed so each can be loaded
+or zipped as is.
 
 ## Top browsers → which build + store
 
