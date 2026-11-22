@@ -236,8 +236,8 @@ async function sendEnvelope(env) {
 }
 
 // pollLoop long-polls the bridge forever, handling each envelope from the peer. A 204
-// (idle timeout) or a transient error just re-polls; the MV3 worker is kept alive by the
-// in-flight fetch, and onMessage/alarms restart this if the worker was ever evicted.
+// (idle timeout) or a transient error just re-polls. The worker is kept alive by the keep-alive
+// heartbeat (NOT by the in-flight fetch), and the alarm restarts this if the worker was ever evicted.
 let polling = false;
 async function pollLoop() {
   if (polling) return;
@@ -1065,63 +1065,50 @@ chrome.contextMenus.onClicked.addListener((info, tab) => { if (info.menuItemId =
 
 // ---------------- keep-alive ----------------
 //
-// The whole feature depends on the service worker continuously polling /events so a pushed
-// command (capture-window) and incoming opens are received instantly. But MV3 suspends the
-// worker after ~30s idle — even with a pending fetch — which stalls delivery until the worker
-// wakes (commands/opens pile up in the bridge). On a fast machine a periodic API-ping kept it
-// alive; on a SLOW/OLD box (the Win8 laptop runs at most Chrome 109, MV3-transition era) a
-// setInterval-based ping is NOT reliable — a setInterval is silently lost the moment the worker
-// is suspended, so the worker died and only the 30s alarm resurrected it, leaving a dead window
-// of up to ~30s where teleports "took ages". Three layers, strongest first:
-//   1) a PORT LIFELINE — a runtime port this worker opens to its own extension. With another
-//      extension context present the port stays open and holds the worker alive (Chrome
-//      force-disconnects ports at ~5 min, so it is renewed before that). With none — the usual
-//      case — the browser refuses it at once, and the lifeline is then a slow retry whose refusal
-//      events are what keep the worker awake. See startLifeline for why it must never retry fast.
-//   2) an AWAITED getPlatformInfo loop (every 15s) as a secondary timer-based reset.
-//   3) a coarse alarm (0.5 min) that survives an actual eviction and re-enters pollLoop.
-// DO NOT RECONNECT A REFUSED PORT AT ONCE (2026-11-22). A browser delivers runtime.connect only to
-// OTHER contexts of the extension, never to the one that called it, and this worker is usually the
-// extension's only context. So the connect below is refused on the spot and onDisconnect fires
-// immediately. Reconnecting from that handler with no delay was a tight loop: measured, it held
-// the BROWSER process at a full CPU core for as long as the extension ran (a probe extension with
-// nothing but that code: 10.4 s of browser CPU per 10 s; without it: 0.02 s), and a browser main
-// thread that busy loses mouse clicks meant for Chrome's native title-bar menu.
-// A refused attempt is still an event delivered to this worker, and a delivered event is what
-// resets the worker's idle timer, so retrying on a SLOW beat keeps the keep-alive effect.
-const LIFELINE_RETRY_MS = 20000;   // comfortably inside the ~30s idle limit named above
-const LIFELINE_REFUSED_MS = 5000;  // a port that closed sooner than this was never really open
-let lifelinePort = null;
-let lifelineRetry = null;
-function startLifeline() {
-  if (lifelinePort || lifelineRetry) return;
-  const openedAt = Date.now();
-  try {
-    lifelinePort = chrome.runtime.connect({ name: "keepalive" });
-    lifelinePort.onDisconnect.addListener(() => {
-      void chrome.runtime.lastError; // swallow "port closed" / "receiving end does not exist"
-      lifelinePort = null;
-      if (Date.now() - openedAt >= LIFELINE_REFUSED_MS) { startLifeline(); return; } // a real lease ended: renew it
-      lifelineRetry = setTimeout(() => { lifelineRetry = null; startLifeline(); }, LIFELINE_RETRY_MS);
-    });
-  } catch (e) { lifelinePort = null; }
-}
-// The other end of the lifeline lives in THIS same worker (a self-connect): holding the port
-// open keeps the worker alive. Drop it just before Chrome's ~5-min hard port limit so the
-// onDisconnect above reconnects (a fresh lease) rather than Chrome killing the worker.
-chrome.runtime.onConnect.addListener((port) => {
-  if (port.name !== "keepalive") return;
-  setTimeout(() => { try { port.disconnect(); } catch (e) {} }, 250000); // ~4m10s < 5m cap
-});
-
-let keepAliveTimer = null;
+// The whole feature depends on this worker continuously polling /events, so a pushed command
+// (capture-window) or an incoming open is handled at once. A worker that has died is restarted only
+// by the next event, and until then commands pile up in the bridge. Two pieces, nothing else:
+//
+// 1) THE HEARTBEAT keeps the worker alive. Every HEARTBEAT_MS it writes a counter to
+//    storage.session. That is an extension API call, which resets Chrome's 30 s idle timer since
+//    Chrome 110 ("Receiving an event or calling an extension API resets this timer"; "Chrome 110:
+//    Extension API calls reset the timers. Before this, only running event handlers would keep a
+//    service worker alive" — developer.chrome.com, extension service worker lifecycle). The write
+//    ALSO fires storage.onChanged in this worker (a listener is registered at the top of the file),
+//    i.e. an event handler runs — the only thing that counted before Chrome 110. The long-poll
+//    itself does not keep the worker alive, and must not try: "a fetch() response [that] takes more
+//    than 30 seconds to arrive" gets the worker terminated (same page); the bridge answers within 25 s.
+//    MEASURED 2026-11-22, a probe extension holding only this heartbeat and the alarm below, in an
+//    isolated headless Edge 125: ONE worker for the whole 330 s run (16 heartbeats, each delivered
+//    as a storage.onChanged event), browser-tree CPU 0.52 s over 330 s. The same probe WITHOUT the
+//    heartbeat: a new worker every ~30 s, each restarted by the alarm (12 workers in 330 s).
+//    Firefox 127 (MV3 background = an event page, "unloaded when they become idle"; MDN gives no
+//    number): ONE page for 330 s with the heartbeat — and also without it, where the 30 s alarm
+//    alone kept it, so Firefox's own idle rule was not isolated. Chrome 109 (the Windows 8 laptop
+//    this was first written for) was NOT measured: the heartbeat's event there is reasoned from the
+//    pre-110 rule above, not tested.
+//    HEARTBEAT_MS = 20 s: inside the 30 s idle limit with a 10 s margin for timer slack.
+// 2) THE ALARM is the backstop that restarts a worker that did die (an update, a crash, a browser
+//    that terminates it anyway): its event starts a fresh worker, whose top-level boot() runs, and
+//    onAlarm makes sure the heartbeat and poll loop are going. Period 0.5 min: MDN
+//    (alarms.create) — "In Chrome, unless the extension is loaded unpackaged, alarms do not fire more
+//    than once every 30 seconds. Before Chrome 120, this limit was one minute." So it fires every 30 s
+//    unpacked or on Chrome 120+, every 60 s on an older packed Chrome. Firefox states no minimum.
+// Removed (2.19): the runtime.connect "lifeline" port and its onConnect listener. A browser never
+// delivers runtime.connect to the context that called it, and this worker is normally the
+// extension's only context, so the port was refused on the spot (and, reconnected with no delay,
+// was the 2.17 hot loop); Chrome 114+ also states "Opening a port no longer resets the timers". The
+// 15 s getPlatformInfo interval is replaced by the heartbeat, which does the same job and is an
+// event as well.
+const HEARTBEAT_MS = 20000;
+let heartbeatTimer = null;
+let heartbeats = 0;
 function startKeepAlive() {
-  startLifeline();
-  if (keepAliveTimer) return;
-  // AWAITED (not fire-and-forget): the response coming back is what resets the idle timer.
-  keepAliveTimer = setInterval(async () => {
-    try { await chrome.runtime.getPlatformInfo(); } catch (e) {}
-  }, 15000);
+  if (heartbeatTimer) return;
+  heartbeatTimer = setInterval(() => {
+    heartbeats++;
+    storageSet("session", { mtHeartbeat: heartbeats }, "heartbeat");
+  }, HEARTBEAT_MS);
 }
 
 // ---------------- carry-back (teleport-profile windows -> normal profile) ----------------
@@ -1442,7 +1429,12 @@ async function openCarrybackDirect() {
 // ---------------- boot ----------------
 
 if (chrome.alarms) {
-  chrome.alarms.create("keepalive", { periodInMinutes: 0.5 }); // backstop if the worker ever dies
+  // The backstop (see the keep-alive section). create() returns a Promise in Chrome MV3 and nothing in
+  // some engines: handle both, so a refusal is reported rather than left unhandled.
+  try {
+    const p = chrome.alarms.create("keepalive", { periodInMinutes: 0.5 });
+    if (p && typeof p.catch === "function") p.catch((e) => dbg("alarms.create failed: " + e));
+  } catch (e) { dbg("alarms.create threw: " + e); }
   chrome.alarms.onAlarm.addListener(() => { startKeepAlive(); pollLoop(); });
 }
 // On a real browser STARTUP (not a worker resurrection): boot, then in the NORMAL profile open the staged
