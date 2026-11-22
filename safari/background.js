@@ -399,9 +399,14 @@ function pcUpdate(fn) {
     catch (e) { dbg("pending-close registry: write failed: " + e); }
   });
 }
-function pcSet(moveId, entry) { return pcUpdate((m) => { m[moveId] = entry; }); }
-function pcMark(moveId, patch) { return pcUpdate((m) => { if (!m[moveId]) return false; Object.assign(m[moveId], patch); }); }
-function pcDel(moveId) { return pcUpdate((m) => { if (!(moveId in m)) return false; delete m[moveId]; }); }
+// moveIds come from the PEER (an ack names one), so the registry is read by OWN property only: a
+// moveId of "__proto__" or "constructor" must find nothing, never Object.prototype (which pcMark
+// would then have written "acked" onto, for every object in this worker).
+function pcHas(m, moveId) { return typeof moveId === "string" && Object.prototype.hasOwnProperty.call(m, moveId); }
+function pcGet(m, moveId) { return pcHas(m, moveId) ? m[moveId] : undefined; }
+function pcSet(moveId, entry) { return pcUpdate((m) => { if (typeof moveId !== "string" || moveId === "__proto__") return false; m[moveId] = entry; }); }
+function pcMark(moveId, patch) { return pcUpdate((m) => { const e = pcGet(m, moveId); if (!e || typeof e !== "object") return false; Object.assign(e, patch); }); }
+function pcDel(moveId) { return pcUpdate((m) => { if (!pcHas(m, moveId)) return false; delete m[moveId]; }); }
 
 // storageSet writes to storage.local/session without letting a rejection escape unhandled (an
 // un-awaited set() inside try/catch catches nothing: the failure arrives later, as a rejection).
@@ -420,8 +425,8 @@ const closingNow = new Set(); // moveIds with a live closeWhenPossible loop (avo
 // are left alone: without the peer's ack the tabs may exist ONLY here, so closing would lose them.
 async function recheckCloses(reason) {
   const m = await pcLoad();
-  for (const id in m) {
-    if (m[id].acked && !closingNow.has(id)) {
+  for (const id of Object.keys(m)) {
+    if (m[id] && m[id].acked && !closingNow.has(id)) {
       dbg("recheck-closes(" + reason + "): re-driving close for " + id + " (" + m[id].type + " " + m[id].id + ")");
       closeWhenPossible(m[id], id);
     }
@@ -895,9 +900,11 @@ async function handleEnvelope(env) {
   }
 
   if (env.kind === "ack") {
+    if (typeof env.moveId !== "string") return;
     let target = pendingClose.get(env.moveId);
     pendingClose.delete(env.moveId);
-    if (!target) { const m = await pcLoad(); target = m[env.moveId]; } // a resurrected worker: recover from the durable registry
+    if (!target) { const m = await pcLoad(); target = pcGet(m, env.moveId); } // a resurrected worker: recover from the durable registry
+    if (target && (typeof target !== "object" || (target.type !== "tab" && target.type !== "window"))) target = undefined;
     if (target) {
       await pcMark(env.moveId, { acked: true }); // durably acked BEFORE closing, so a re-drive is allowed to finish it
       closeWhenPossible(target, env.moveId);

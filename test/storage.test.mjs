@@ -39,3 +39,16 @@ test("a rejected storage write is reported with dbg, not left unhandled", async 
     process.off("unhandledRejection", onUnhandled);
   }
 });
+
+test("an ack whose moveId is __proto__ or constructor touches nothing (no prototype pollution)", async () => {
+  const h = await loadBackground({ windows: [{ id: 1, tabs: [{ id: 11, url: "https://a/" }] }] });
+  await h.tick(100);
+  for (const moveId of ["__proto__", "constructor", "toString", "hasOwnProperty"]) {
+    const p = h.fn("handleEnvelope")({ v: 1, kind: "ack", moveId });
+    await h.tick(1000); await p;
+  }
+  assert.equal(h.get("({}).acked"), undefined, "Object.prototype untouched");
+  assert.equal(h.get("Object.acked"), undefined);
+  assert.equal(h.called("tabs.remove").length, 0);
+  assert.equal(h.world.windows[0].tabs.length, 1);
+});
