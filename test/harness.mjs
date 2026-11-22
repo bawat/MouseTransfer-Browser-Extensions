@@ -144,7 +144,7 @@ function makeStorageArea(areaName, data, onChanged, record, hook) {
 
 // The window/tab world. windows: [{id, left, top, width, height, focused, type, tabs:[{id, url, active}]}]
 function makeWorld(init, bookmarks) {
-  const w = { windows: [], nextId: 1000, bookmarks: { "0": { id: "0", title: "" }, "1": { id: "1", parentId: "0", title: "Bookmarks bar" }, ...(bookmarks || {}) } };
+  const w = { windows: [], nextId: 1000, bookmarks: { "0": { id: "0", title: "" }, "1": { id: "1", parentId: "0", title: "Bookmarks bar" }, "2": { id: "2", parentId: "0", title: "Other bookmarks" }, ...(bookmarks || {}) } };
   for (const win of (init || [])) {
     const id = win.id ?? w.nextId++;
     w.windows.push({ left: 0, top: 0, width: 800, height: 600, type: "normal", focused: false, ...win, id,
@@ -287,8 +287,9 @@ function makeChrome(opts, record, world, tools) {
       create: (bm) => {
         record("bookmarks.create", bm);
         if (opts.bookmarksCreate) { const r = opts.bookmarksCreate(bm); if (r) return r; }
-        if (!world.bookmarks[bm.parentId]) return Promise.reject(new Error("Can't find parent bookmark for id."));
-        const n = { id: String(world.nextId++), parentId: bm.parentId, title: bm.title || "" };
+        const parentId = bm.parentId === undefined ? "2" : bm.parentId; // the documented default: Other Bookmarks
+        if (!world.bookmarks[parentId]) return Promise.reject(new Error("Can't find parent bookmark for id."));
+        const n = { id: String(world.nextId++), parentId, title: bm.title || "" };
         if (bm.url) n.url = bm.url;
         world.bookmarks[n.id] = n;
         return Promise.resolve({ ...n });

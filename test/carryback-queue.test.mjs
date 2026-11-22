@@ -113,3 +113,18 @@ test("restore without bookmarks (Safari), new wrapper: only opened windows are a
   assert.deepEqual(h.fetched("/carryback-ack").map(body), [{ ids: ["w1"] }]);
   assert.deepEqual(queue.map((w) => w.id), ["w2"]);
 });
+
+test("stage: where the bookmark bar is not id \"1\" (Firefox GUIDs) the folder goes to the default folder", async () => {
+  const queue = [W1];
+  const h = await loadBackground({
+    fetch: queueRoute("legacy", queue),
+    // Firefox 127, measured: create({parentId: "1"}) -> Invalid bookmark (its folders are GUIDs)
+    bookmarksCreate: (b) => (b.parentId === "1" ? Promise.reject(new Error('Invalid bookmark: {"title":"mousetransfer-toopen","type":2,"parentGuid":"1"}')) : undefined),
+  });
+  await h.tick(3000);
+  const folder = folderOf(h);
+  assert.ok(folder, "folder created");
+  assert.equal(folder.parentId, "2");
+  assert.equal(childrenOf(h, folder.id).length, 1, "W1 staged");
+  assert.equal(h.fetched("/carryback").length, 0, "nothing needed putting back");
+});

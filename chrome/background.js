@@ -1304,9 +1304,16 @@ async function findCarrybackFolder() {
   try { for (const h of await chrome.bookmarks.search({ title: CARRYBACK_FOLDER })) if (!h.url) return h; } catch (e) {}
   return null;
 }
+// The folder goes on the bookmark bar where the bar's id is "1" (Chromium), as it always has. Firefox
+// names its built-in folders by GUID ("1" is refused: measured 2026-11-22 in Firefox 127 —
+// "Invalid bookmark: {…parentGuid:"1"}"), so there it is created with NO parentId, which both
+// engines document as "defaults to the Other Bookmarks folder" (Chrome bookmarks.create; MDN
+// bookmarks.create). The wrapper strips the folder from a teleport profile in either place.
 async function ensureCarrybackFolder() {
   const f = await findCarrybackFolder(); if (f) return f;
-  try { return await chrome.bookmarks.create({ parentId: "1", title: CARRYBACK_FOLDER }); } // "1" = bookmark bar
+  try { return await chrome.bookmarks.create({ parentId: "1", title: CARRYBACK_FOLDER }); } // "1" = Chromium's bookmark bar
+  catch (e) { /* not Chromium's id scheme: use the browser's default folder */ }
+  try { return await chrome.bookmarks.create({ title: CARRYBACK_FOLDER }); }
   catch (e) { dbg("carryback: could not create the bookmark folder: " + e); return null; }
 }
 
