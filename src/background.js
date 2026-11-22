@@ -267,21 +267,22 @@ async function findWindowByPxRect(wl, wt, ww, wh) {
 // source drag may have ended (or a tear been reverted), moving focus — focus-based capture
 // then teleported AND CLOSED the whole original window or a completely unrelated one (the
 // 2026-07-03 YouTube-tab reports). No bounds match -> ABORT: better no teleport (the window
-// just stays put) than the wrong window leaving the machine. Legacy envelopes without a rect
-// keep the focus capture.
+// just stays put) than the wrong window leaving the machine.
+// There is NO focus-based fallback any more, not even for an envelope without a rect: the only
+// sender (the wrapper's teleportFocusedBrowserWindow) has put wl/wt/ww/wh in every capture-window
+// since 2026-07-03, so a rect-less envelope can only be malformed or from a wrapper older than
+// that — and focus capture is exactly the thing that closed the wrong window.
+function hasUsableRect(env) {
+  return !!env && ["wl", "wt", "ww", "wh"].every((k) => typeof env[k] === "number" && isFinite(env[k])) && env.ww > 0 && env.wh > 0;
+}
 async function teleportFocusedWindow(env) {
-  let win = null;
-  if (env && typeof env.ww === "number") {
-    // A rect-aware wrapper sent this. NEVER fall back to focus capture here — even for a
-    // zero/unusable rect: focus at capture time can name the original multi-tab window (or an
-    // unrelated one) after a lost tear race, and capturing it teleports+closes the wrong thing.
-    if (!(env.ww > 0 && env.wh > 0)) { dbg("capture-window: no usable rect — ABORTING (never guess by focus)"); return; }
-    win = await findWindowByPxRect(env.wl, env.wt, env.ww, env.wh);
-    if (!win) { dbg("capture-window: ABORTING teleport — dragged window not found (drag reverted/closed?)"); return; }
-  } else {
-    win = await chrome.windows.getLastFocused({ populate: true }); // legacy wrapper without a rect
+  if (!hasUsableRect(env)) {
+    dbg("capture-window: no usable rect (wl=" + (env && env.wl) + " wt=" + (env && env.wt) + " ww=" + (env && env.ww) + " wh=" + (env && env.wh) + ") — ABORTING (never guess by focus)");
+    return;
   }
-  if (!win || !win.tabs || !win.tabs.length) return;
+  const win = await findWindowByPxRect(env.wl, env.wt, env.ww, env.wh);
+  if (!win) { dbg("capture-window: ABORTING teleport — dragged window not found (drag reverted/closed?)"); return; }
+  if (!win.tabs || !win.tabs.length) return;
   const tabs = [];
   for (const tab of win.tabs) {
     const t = await captureTab(tab);

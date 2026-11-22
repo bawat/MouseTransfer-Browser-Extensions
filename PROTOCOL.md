@@ -65,12 +65,20 @@ Merged does not parse these — both extensions must agree on them. Always inclu
 ### `capture-window` — (Merged → its LOCAL extension only)
 
 ```json
-{ "v": 1, "kind": "capture-window" }
+{ "v": 1, "kind": "capture-window", "wl": 900, "wt": 100, "ww": 1050, "wh": 750 }
 ```
 
 Not a peer message: Merged pushes this to the extension on the *same* computer when it
-detects a browser window dragged across the screen seam. The extension captures the
-focused window's tabs and sends them to the peer as an `open` with `asWindow: true`.
+detects a browser window dragged across the screen seam. `wl`/`wt`/`ww`/`wh` are the dragged
+window's on-screen rect in screen **pixels** (Win32 `GetWindowRect`) and are **required**.
+The extension finds the window whose bounds match that rect (trying the standard display
+scale factors, since its own bounds are in DIPs; with exactly one open window, that window)
+and sends its tabs to the peer as an `open` with `asWindow: true`.
+
+If the rect is missing, zero-sized, or matches none of several windows, the extension
+**aborts** and the window stays where it is. It never falls back to "the focused window":
+by the time the extension runs, focus can belong to a different window, and capturing it
+teleported and closed the wrong one.
 
 ### `ack` — "I opened it; you may close yours"
 
