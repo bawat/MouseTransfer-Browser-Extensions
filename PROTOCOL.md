@@ -65,6 +65,8 @@ not use it ignores the unknown query parameter.
 | Method & path | Body | Purpose |
 |---|---|---|
 | `POST /focus?token=<t>&client=<id>` | none | A normal window of this browser profile gained focus (a burst of focus changes sends one report, ~120 ms after the last). Lets Merged deliver an incoming teleport to the browser the user is in. |
+| `GET /carryback-drain?token=<t>&peek=1` | — | The carry-back queue (whole windows closed in the teleport profile). The extension always asks with `peek=1`. A Merged that supports it answers `{"peek":true,"windows":[{"id":"<string>","tabs":["…"],"at":<ns>},…]}` and removes **nothing**; one that does not ignores `peek`, answers `{"windows":[…]}` without `"peek"` and empties its queue — the extension then puts back, with `POST /carryback {"tabs":[…]}`, every window it failed to store or open. |
+| `POST /carryback-ack?token=<t>` | `{"ids":["<string>",…]}` | Only after a `peek` drain: remove these windows from the queue (they were stored as bookmarks or opened). Windows are named by the string `id`, never by `at`: a nanosecond timestamp does not survive a JavaScript number. A peek window without a string `id` is left queued. |
 | `POST /source-kept?token=<t>` | `{"phase":"captured"\|"closed","moveId":"…","cid":<capture-window cid or null>,"kept":N,"sent":N}` (`sent` only with `captured`) | After a whole-window teleport the source window will **stay open** because it holds `kept` tabs that were not sent (browser-internal pages, local files, tabs opened after the capture). `captured` is sent before the `open`; `closed` once the close has finished and the window is still open. Merged must not force-close that window. Sent only when `kept > 0`. |
 
 ## Envelopes

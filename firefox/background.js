@@ -1285,34 +1285,95 @@ async function findCarrybackFolder() {
 }
 async function ensureCarrybackFolder() {
   const f = await findCarrybackFolder(); if (f) return f;
-  try { return await chrome.bookmarks.create({ parentId: "1", title: CARRYBACK_FOLDER }); } catch (e) { return null; } // "1" = bookmark bar
+  try { return await chrome.bookmarks.create({ parentId: "1", title: CARRYBACK_FOLDER }); } // "1" = bookmark bar
+  catch (e) { dbg("carryback: could not create the bookmark folder: " + e); return null; }
 }
-// stageCarryback drains the wrapper queue into mousetransfer-toopen bookmark subfolders (one per window).
+
+// ---- the carry-back queue: two drain modes ----
+// GET /carryback-drain hands over the wrapper's queued windows. A wrapper that predates 2.19 REMOVES
+// them as it answers (one-shot). We always ask with peek=1: a wrapper that supports it answers
+// {"peek":true,"windows":[{"id":"…","tabs":[…],"at":…},…]} and removes NOTHING until we
+// acknowledge, per window, with POST /carryback-ack {"ids":[…]}; an older wrapper ignores the
+// parameter and answers without "peek" — then the windows are already gone from its queue, and any
+// we fail to store/open are PUT BACK with the ordinary POST /carryback {"tabs":[…]}. Either way a
+// window is let go only once it is safely stored or opened.
+// Acks name windows by the string "id": "at" is a nanosecond timestamp (~1.7e18), beyond the 2^53
+// a JavaScript number holds exactly, so it cannot identify a window on the way back. A peek window
+// without a string id is left in the queue untouched (never stored, so it cannot be duplicated).
+async function drainCarryback() {
+  let res;
+  try { res = await bridgeFetch("/carryback-drain", undefined, "&peek=1"); } catch (e) { return null; }
+  if (!res.ok) return null;
+  let j;
+  try { j = await res.json(); } catch (e) { dbg("carryback: unreadable drain answer: " + e); return null; }
+  return { peek: !!(j && j.peek === true), windows: (j && Array.isArray(j.windows)) ? j.windows : [] };
+}
+// settleCarryback lets go of the windows that were handled and keeps the rest (see drainCarryback).
+async function settleCarryback(drain, done, failed) {
+  if (drain.peek) {
+    const ids = done.map((w) => w.id);
+    if (!ids.length) return;
+    try {
+      const res = await bridgeFetch("/carryback-ack", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ids }) });
+      if (!res.ok) dbg("carryback: ack refused (" + res.status + ") — the windows stay queued and will be offered again");
+    } catch (e) { dbg("carryback: ack failed (" + e + ") — the windows stay queued and will be offered again"); }
+    return;
+  }
+  for (const w of failed) {
+    try {
+      const res = await bridgeFetch("/carryback", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tabs: w.tabs }) });
+      if (!res.ok) dbg("carryback: could not put a window back (" + res.status + ") — it is lost");
+    } catch (e) { dbg("carryback: could not put a window back (" + e + ") — it is lost"); }
+  }
+}
+function carrybackUrls(win) { return (win && Array.isArray(win.tabs) ? win.tabs : []).filter(isWebUrl); }
+// openCarrybackWindow opens one carried-back window; it throws only if the WINDOW could not be made
+// (a tab that fails after that is logged: the window exists, so it must not be offered again).
+async function openCarrybackWindow(urls) {
+  const w = await chrome.windows.create({ url: urls[0] });
+  for (let i = 1; i < urls.length; i++) {
+    try { await chrome.tabs.create({ windowId: w.id, url: urls[i], active: false }); }
+    catch (e) { dbg("carryback: a tab of a restored window failed to open: " + e); }
+  }
+}
+
+// stageCarryback moves the wrapper queue into mousetransfer-toopen bookmark subfolders (one per window).
 // No windows are opened — so a worker resurrection mid-session never pops windows; it just persists them.
 async function stageCarryback() {
   // Safari has NO bookmarks API (Apple's compatibility page lists no bookmarks support; MDN BCD
-  // webextensions/api/bookmarks: safari version_added=false). GET /carryback-drain is ONE-SHOT and
-  // destructive — draining with nowhere to stage would silently lose the windows. Without bookmarks,
-  // leave the queue with the wrapper (durable in carryback.json) and open it directly on the next
-  // real startup instead (restoreCarryback's direct path).
+  // webextensions/api/bookmarks: safari version_added=false). Draining with nowhere to stage would
+  // lose the windows on an older (destructive-drain) wrapper, so without bookmarks the queue stays
+  // with the wrapper (durable in carryback.json) and is opened directly on the next real startup.
   if (!(chrome.bookmarks && chrome.bookmarks.create)) { dbg("carryback: bookmarks API unavailable — leaving queue staged in the wrapper"); return; }
-  let pending = [];
-  try { const res = await bridgeFetch("/carryback-drain"); pending = (res.ok && (await res.json()).windows) || []; } catch (e) { return; }
-  if (!pending.length) return;
-  const folder = await ensureCarrybackFolder(); if (!folder) return;
-  for (const win of pending) {
-    const urls = (win.tabs || []).filter((u) => /^https?:/i.test(u));
-    if (!urls.length) continue;
+  // The folder must exist BEFORE anything is drained: with a destructive drain, discovering after
+  // the fact that there is nowhere to put the windows used to lose them.
+  const folder = await ensureCarrybackFolder();
+  if (!folder) return;
+  const drain = await drainCarryback();
+  if (!drain || !drain.windows.length) return;
+  const done = [], failed = [];
+  for (const win of drain.windows) {
+    if (drain.peek && typeof win.id !== "string") { dbg("carryback: a queued window has no id — leaving it queued"); continue; }
+    const urls = carrybackUrls(win);
+    if (!urls.length) { done.push(win); continue; } // nothing openable: let it go
+    let sub = null;
     try {
-      const sub = await chrome.bookmarks.create({ parentId: folder.id, title: "window-" + (win.at || "") });
+      sub = await chrome.bookmarks.create({ parentId: folder.id, title: "window-" + (win.at || "") });
       for (const url of urls) await chrome.bookmarks.create({ parentId: sub.id, title: url, url });
-    } catch (e) {}
+      done.push(win);
+    } catch (e) {
+      failed.push(win);
+      dbg("carryback: could not store a window as bookmarks (" + e + ") — keeping it queued");
+      if (sub) { try { await chrome.bookmarks.removeTree(sub.id); } catch (e2) {} } // no half-stored window
+    }
   }
-  dbg("carryback: staged " + pending.length + " window(s) as bookmarks");
+  await settleCarryback(drain, done, failed);
+  dbg("carryback: staged " + done.length + "/" + drain.windows.length + " window(s) as bookmarks" + (drain.peek ? "" : " (destructive drain; " + failed.length + " put back)"));
 }
-// restoreCarryback opens each staged subfolder as a window, then deletes the whole folder. Called ONLY on
-// a real browser startup (chrome.runtime.onStartup), so carried-back windows appear alongside the user's
-// own session-resume — never mid-session.
+// restoreCarryback opens each staged subfolder as a window and removes ONLY the subfolders whose window
+// opened; the root folder goes only once it is empty. Called ONLY on a real browser startup
+// (chrome.runtime.onStartup), so carried-back windows appear alongside the user's own session-resume
+// — never mid-session. A subfolder that failed to open stays for the next startup.
 async function restoreCarryback() {
   // No bookmarks API (Safari): open the wrapper's queued windows DIRECTLY. This runs only on a real
   // browser startup (runtime.onStartup) — exactly when opening windows is safe. The bookmark staging
@@ -1322,39 +1383,38 @@ async function restoreCarryback() {
   const folder = await findCarrybackFolder(); if (!folder) return;
   let subs = [];
   try { subs = await chrome.bookmarks.getChildren(folder.id); } catch (e) { return; }
-  let opened = 0;
+  let opened = 0, failed = 0;
   for (const sub of subs) {
     if (sub.url) continue; // only subfolders
     let urls = [];
-    try { urls = (await chrome.bookmarks.getChildren(sub.id)).filter((k) => k.url).map((k) => k.url); } catch (e) { continue; }
-    if (!urls.length) continue;
-    try {
-      const w = await chrome.windows.create({ url: urls[0] });
-      for (let i = 1; i < urls.length; i++) await chrome.tabs.create({ windowId: w.id, url: urls[i], active: false });
-      opened++;
-    } catch (e) {}
+    try { urls = (await chrome.bookmarks.getChildren(sub.id)).filter((k) => isWebUrl(k.url)).map((k) => k.url); } catch (e) { failed++; continue; }
+    if (urls.length) {
+      try { await openCarrybackWindow(urls); opened++; }
+      catch (e) { failed++; dbg("carryback: could not open a staged window (" + e + ") — keeping it for the next startup"); continue; }
+    }
+    try { await chrome.bookmarks.removeTree(sub.id); } catch (e) { dbg("carryback: could not remove a restored subfolder: " + e); }
   }
-  try { await chrome.bookmarks.removeTree(folder.id); } catch (e) {} // clear after restoring
-  dbg("carryback: restored + cleared " + opened + " window(s)");
+  try {
+    if (!(await chrome.bookmarks.getChildren(folder.id)).length) await chrome.bookmarks.remove(folder.id);
+  } catch (e) {}
+  dbg("carryback: restored " + opened + " window(s)" + (failed ? ", " + failed + " kept for the next startup" : ""));
 }
 // openCarrybackDirect drains the wrapper queue and opens each carried-back window immediately —
 // the bookmarks-free (Safari) restore path. Only ever called from the real-startup context above,
 // so the mid-session-window-popping hazard the bookmark staging guards against cannot occur here.
 async function openCarrybackDirect() {
-  let pending = [];
-  try { const res = await bridgeFetch("/carryback-drain"); pending = (res.ok && (await res.json()).windows) || []; } catch (e) { return; }
-  if (!pending.length) return;
-  let opened = 0;
-  for (const win of pending) {
-    const urls = (win.tabs || []).filter((u) => /^https?:/i.test(u));
-    if (!urls.length) continue;
-    try {
-      const w = await chrome.windows.create({ url: urls[0] });
-      for (let i = 1; i < urls.length; i++) await chrome.tabs.create({ windowId: w.id, url: urls[i], active: false });
-      opened++;
-    } catch (e) {}
+  const drain = await drainCarryback();
+  if (!drain || !drain.windows.length) return;
+  const done = [], failed = [];
+  for (const win of drain.windows) {
+    if (drain.peek && typeof win.id !== "string") { dbg("carryback: a queued window has no id — leaving it queued"); continue; }
+    const urls = carrybackUrls(win);
+    if (!urls.length) { done.push(win); continue; }
+    try { await openCarrybackWindow(urls); done.push(win); }
+    catch (e) { failed.push(win); dbg("carryback: could not open a queued window (" + e + ") — keeping it queued"); }
   }
-  dbg("carryback: opened " + opened + "/" + pending.length + " window(s) directly (no bookmarks API)");
+  await settleCarryback(drain, done, failed);
+  dbg("carryback: opened " + done.length + "/" + drain.windows.length + " window(s) directly (no bookmarks API)");
 }
 
 // ---------------- boot ----------------

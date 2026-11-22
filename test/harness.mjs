@@ -143,8 +143,8 @@ function makeStorageArea(areaName, data, onChanged, record, hook) {
 }
 
 // The window/tab world. windows: [{id, left, top, width, height, focused, type, tabs:[{id, url, active}]}]
-function makeWorld(init) {
-  const w = { windows: [], nextId: 1000 };
+function makeWorld(init, bookmarks) {
+  const w = { windows: [], nextId: 1000, bookmarks: { "0": { id: "0", title: "" }, "1": { id: "1", parentId: "0", title: "Bookmarks bar" }, ...(bookmarks || {}) } };
   for (const win of (init || [])) {
     const id = win.id ?? w.nextId++;
     w.windows.push({ left: 0, top: 0, width: 800, height: 600, type: "normal", focused: false, ...win, id,
@@ -276,11 +276,40 @@ function makeChrome(opts, record, world, tools) {
       },
       move: (ids, props) => { record("tabs.move", ids, props); return Promise.resolve([]); },
     },
+    // A real in-memory bookmark tree: world.bookmarks maps id -> {id, parentId, title, url?}.
+    // "1" is the bookmark bar (Chrome's id for it). opts.bookmarksCreate(b) may return a rejection.
     bookmarks: {
-      search: (q) => { record("bookmarks.search", q); return Promise.resolve([]); },
-      create: (b) => { record("bookmarks.create", b); return Promise.resolve({ id: String(world.nextId++), ...b }); },
-      getChildren: (id) => { record("bookmarks.getChildren", id); return Promise.resolve([]); },
-      removeTree: (id) => { record("bookmarks.removeTree", id); return Promise.resolve(); },
+      search: (q) => {
+        record("bookmarks.search", q);
+        const title = typeof q === "string" ? q : q && q.title;
+        return Promise.resolve(Object.values(world.bookmarks).filter((n) => n.title === title).map((n) => ({ ...n })));
+      },
+      create: (bm) => {
+        record("bookmarks.create", bm);
+        if (opts.bookmarksCreate) { const r = opts.bookmarksCreate(bm); if (r) return r; }
+        if (!world.bookmarks[bm.parentId]) return Promise.reject(new Error("Can't find parent bookmark for id."));
+        const n = { id: String(world.nextId++), parentId: bm.parentId, title: bm.title || "" };
+        if (bm.url) n.url = bm.url;
+        world.bookmarks[n.id] = n;
+        return Promise.resolve({ ...n });
+      },
+      getChildren: (id) => {
+        record("bookmarks.getChildren", id);
+        if (!world.bookmarks[id]) return Promise.reject(new Error("Can't find bookmark for id."));
+        return Promise.resolve(Object.values(world.bookmarks).filter((n) => n.parentId === id).map((n) => ({ ...n })));
+      },
+      remove: (id) => {
+        record("bookmarks.remove", id);
+        if (Object.values(world.bookmarks).some((n) => n.parentId === id)) return Promise.reject(new Error("Can't remove non-empty folder (use recursive to force)."));
+        delete world.bookmarks[id];
+        return Promise.resolve();
+      },
+      removeTree: (id) => {
+        record("bookmarks.removeTree", id);
+        const drop = (x) => { for (const n of Object.values(world.bookmarks)) if (n.parentId === x) drop(n.id); delete world.bookmarks[x]; };
+        drop(id);
+        return Promise.resolve();
+      },
     },
   };
   for (const omit of (opts.omitApis || [])) {
@@ -301,6 +330,7 @@ function makeChrome(opts, record, world, tools) {
 //                                            without sendBeacon, as measured in Chromium)
 //   tabsCreate / windowsCreate / tabsRemove: (args) => Promise|undefined   override one call
 //   executeScript: (injection, tools) => results|Promise   (tools.delay(ms, v) uses the fake clock)
+//   bookmarks: {id: {id, parentId, title, url?}}  extra bookmark nodes; bookmarksCreate: (b) => Promise|undefined
 //   omitApis: ["bookmarks", "tabs.move"]     remove APIs to model an engine without them
 //   storageHook: (area, op, arg) => Error|undefined   make a storage call reject
 //   start: <ms>                              initial fake time
@@ -309,7 +339,7 @@ export async function loadBackground(opts = {}) {
   const calls = [];
   const record = (api, ...args) => calls.push({ api, args: deepCopy(args) });
   const clock = new Clock(opts.start ?? 1_700_000_000_000);
-  const world = makeWorld(opts.windows);
+  const world = makeWorld(opts.windows, opts.bookmarks);
   // tools handed to hooks: delay(ms, value) resolves on the FAKE clock.
   const tools = { delay: (ms, v) => new Promise((r) => clock.setTimeout(() => r(v), ms)), clock };
   const chrome = makeChrome(opts, record, world, tools);
