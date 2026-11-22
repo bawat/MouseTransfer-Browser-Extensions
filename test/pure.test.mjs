@@ -12,6 +12,11 @@ test("bakeYouTubeTime", async (t) => {
     ["https://www.youtube.com/watch?t=30&v=X", 95, "https://www.youtube.com/watch?v=X&t=95s"],
     ["https://youtu.be/ID?t=30", 95, "https://youtu.be/ID?t=95s"],
     ["https://youtu.be/ID", 12.2, "https://youtu.be/ID?t=12s"],
+    // The time belongs in the query, before a #fragment, and an existing t= in front of the
+    // fragment is replaced rather than duplicated.
+    ["https://www.youtube.com/watch?v=X#comments", 95, "https://www.youtube.com/watch?v=X&t=95s#comments"],
+    ["https://www.youtube.com/watch?v=X&t=30#comments", 95, "https://www.youtube.com/watch?v=X&t=95s#comments"],
+    ["https://youtu.be/ID#x", 5, "https://youtu.be/ID?t=5s#x"],
   ];
   for (const [url, secs, want] of cases) {
     await t.test(url, () => assert.equal(bake(url, secs), want));

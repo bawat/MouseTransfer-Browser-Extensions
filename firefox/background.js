@@ -134,9 +134,15 @@ function isYouTube(url) {
 }
 
 // For YouTube the &t= param is the most reliable restore, so bake the time into the URL.
+// The query ends at a #fragment, so the fragment is set aside first: otherwise the time landed
+// INSIDE the fragment (".../watch?v=X#comments&t=95s", which YouTube ignores) and an existing
+// "t=30" right before the "#" was not recognised and stayed.
 function bakeYouTubeTime(url, seconds) {
+  const hash = url.indexOf("#");
+  const frag = hash >= 0 ? url.slice(hash) : "";
+  url = hash >= 0 ? url.slice(0, hash) : url;
   url = url.replace(/([?&])t=\d+s?(&|$)/, "$1").replace(/[?&]$/, "");
-  return url + (url.includes("?") ? "&" : "?") + `t=${Math.floor(seconds)}s`;
+  return url + (url.includes("?") ? "&" : "?") + `t=${Math.floor(seconds)}s` + frag;
 }
 
 // Injected into the page to read restorable state.
