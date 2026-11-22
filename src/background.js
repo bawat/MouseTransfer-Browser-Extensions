@@ -1214,7 +1214,18 @@ chrome.windows.onRemoved.addListener((windowId) => { onWindowClosed(windowId); }
 // the state to the bridge on load and whenever it changes. Bounds are chrome.windows DIP bounds (a
 // worker has no px access); the wrapper matches its px window rect tolerantly. Best-effort — a failed
 // push just leaves the wrapper on its move-loop fallback.
+// ONLY IN YANDEX: the wrapper's one consumer of /winstate is that Yandex tab guard
+// (browserWindowTabCount <- yandexTabCountFor, cmd/maximizedrag_windows.go), and the bridge keeps ONE
+// last-writer-wins list, so another browser's push was not just wasted, it could overwrite Yandex's.
+// Yandex is recognised by the "YaBrowser/" product token in its User-Agent — the same token the
+// wrapper reads from the UA of these very requests (cmd/teleportbrowser_windows.go
+// browserTokensFromUA); a service worker's navigator.userAgent is the browser's UA.
+// Triggers: only events that can change what is reported — the window set (created/removed), a
+// window's tab count (tab created/removed/attached/detached) and its bounds (onBoundsChanged). A
+// focus change alters none of them and is not a trigger.
+const IS_YANDEX = (() => { try { return typeof navigator !== "undefined" && String(navigator.userAgent || "").includes("YaBrowser/"); } catch (e) { return false; } })();
 async function emitWinState() {
+  if (!IS_YANDEX) return;
   let wins;
   try { wins = await chrome.windows.getAll({ populate: true, windowTypes: ["normal"] }); } catch (e) { return; }
   const windows = wins.map((w) => ({ l: w.left | 0, t: w.top | 0, w: w.width | 0, h: w.height | 0,
@@ -1228,14 +1239,15 @@ async function emitWinState() {
 }
 let _winStateTimer = null;
 function pushWinState() { clearTimeout(_winStateTimer); _winStateTimer = setTimeout(emitWinState, 120); } // debounce a burst
-chrome.tabs.onCreated.addListener(() => pushWinState());
-chrome.tabs.onRemoved.addListener(() => pushWinState());
-chrome.tabs.onAttached.addListener(() => pushWinState());
-chrome.tabs.onDetached.addListener(() => pushWinState());
-chrome.windows.onCreated.addListener(() => pushWinState());
-chrome.windows.onRemoved.addListener(() => pushWinState());
-chrome.windows.onFocusChanged.addListener(() => pushWinState());
-if (chrome.windows.onBoundsChanged) chrome.windows.onBoundsChanged.addListener(() => pushWinState()); // newer Chromium; guarded
+if (IS_YANDEX) {
+  chrome.tabs.onCreated.addListener(() => pushWinState());
+  chrome.tabs.onRemoved.addListener(() => pushWinState());
+  chrome.tabs.onAttached.addListener(() => pushWinState());
+  chrome.tabs.onDetached.addListener(() => pushWinState());
+  chrome.windows.onCreated.addListener(() => pushWinState());
+  chrome.windows.onRemoved.addListener(() => pushWinState());
+  if (chrome.windows.onBoundsChanged) chrome.windows.onBoundsChanged.addListener(() => pushWinState()); // Chromium 86+; guarded
+}
 
 // onWindowClosed carries a whole closed window back to the normal profile — ONLY in the teleport profile,
 // ONLY for a genuine user close (not a teleport-away), and only if it had http(s) tabs. Robust against a
@@ -1451,7 +1463,7 @@ async function doBoot() {
   await initWinTabs();
   recheckCloses("boot"); // a resurrected worker finishes any acked close it lost mid-retry
   pollLoop();
-  emitWinState(); // push the initial window/tab state so the wrapper's tab-blacklist has it before any drag
+  emitWinState(); // Yandex only: push the initial window/tab state so the wrapper's tab-blacklist has it before any drag
   // NORMAL profile: surface any windows closed while it was offline as bookmarks now (no windows opened
   // here — restoreCarryback on a real startup does that). Idempotent: the wrapper queue drain is one-shot.
   if (PROFILE_ROLE === "normal") await stageCarryback();
