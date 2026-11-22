@@ -44,7 +44,7 @@ const GENERATED_HEADER =
 // Key order for generated manifests, so they read like the hand-written ones did. Keys not listed
 // keep their merge order after these.
 const MANIFEST_KEY_ORDER = ["manifest_version", "name", "version", "description", "key",
-  "browser_specific_settings", "action", "icons", "permissions", "host_permissions", "background",
+  "browser_specific_settings", "action", "icons", "incognito", "permissions", "host_permissions", "background",
   "options_ui", "commands"];
 
 const lf = (s) => s.replace(/\r\n/g, "\n");

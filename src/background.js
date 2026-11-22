@@ -417,6 +417,7 @@ async function recheckCloses(reason) {
 
 // teleportTab sends a single tab (the Phase-1 shortcut/context-menu path).
 async function teleportTab(tab) {
+  if (tab && tab.incognito) { dbg("teleport: refusing a private/incognito tab"); return; }
   const t = await captureTab(tab);
   if (!t) { console.warn("Teleporter: only http(s) tabs can be teleported"); return; }
   const moveId = crypto.randomUUID();
@@ -434,7 +435,8 @@ async function teleportTab(tab) {
 // (Win32, px), trying each standard Windows scale factor (Settings > Display offers 100-250%)
 // to map px -> our DIP bounds. Returns null when nothing is plausibly close — the caller must
 // then ABORT rather than guess.
-async function findWindowByPxRect(wl, wt, ww, wh) {
+// allowLone=false forbids the single-window fallback below (capture-window "lone": false).
+async function findWindowByPxRect(wl, wt, ww, wh, allowLone = true) {
   let wins = [];
   try { wins = await chrome.windows.getAll({ populate: true, windowTypes: ["normal"] }); } catch (e) { return null; }
   // Ignore DEGENERATE zero-size windows: a real dragged top-level window always has a positive
@@ -445,7 +447,12 @@ async function findWindowByPxRect(wl, wt, ww, wh) {
   // match nothing) AND the single-window fallback below (which needs exactly one), so the whole-window
   // capture aborts. A 0x0 window is never what the user dragged — drop it so the visible window is the
   // lone candidate and the fallback can capture it.
-  const normals = wins.filter(w => typeof w.left === "number" && w.width > 0 && w.height > 0);
+  const real = wins.filter(w => typeof w.left === "number" && w.width > 0 && w.height > 0);
+  // NEVER capture an incognito/private window. The manifest keeps the extension out of incognito
+  // where the engine supports that (Chrome, Firefox: "incognito": "not_allowed"), so such windows
+  // are not even listed there; Safari has no "not_allowed" and lists them (spanning mode), so this
+  // filter is what stops them there.
+  const normals = real.filter(w => !w.incognito);
   // Instrumentation (surfaces into the wrapper's btrace via /debug): the wrapper measured
   // wl,wt,ww,wh from Win32 GetWindowRect of the dragged top-level window. Log every candidate's
   // chrome.windows bounds so a QQ-vs-360-vs-Chrome frame-bounds divergence is READABLE from a single
@@ -479,7 +486,15 @@ async function findWindowByPxRect(wl, wt, ww, wh) {
   // is byte-identical (their single window already matches at bestD≈0, never reaching here). The
   // wrapper pushes capture-window ONLY on a CONFIRMED browser-window seam crossing, so the lone
   // window IS the one the user dragged; capturing it is the intended whole-window teleport.
-  if (normals.length === 1) {
+  // The fallback needs the lone window to be the ONLY window we can see: a visible private window
+  // beside it (Safari) means the user may have dragged that one. And it is off altogether when the
+  // wrapper says so (lone:false — a stock-frame browser, whose bounds always match when the window
+  // is ours: a miss there means the dragged window is one we cannot see, e.g. incognito on Chrome).
+  if (!allowLone && normals.length === 1) {
+    dbg("capture-window: strict rect match failed (bestD=" + Math.round(bestD) + ") and the single-window fallback is off (lone:false) — ABORTING");
+    return null;
+  }
+  if (normals.length === 1 && real.length === 1) {
     dbg("capture-window: strict rect match failed (bestD=" + Math.round(bestD) + ") but exactly ONE window exists — capturing it (custom-frame bounds divergence, e.g. QQ) window #" +
         normals[0].id + " bounds=" + normals[0].left + "," + normals[0].top + "," + normals[0].width + "," + normals[0].height);
     return normals[0];
@@ -508,7 +523,7 @@ async function teleportFocusedWindow(env) {
     dbg("capture-window: no usable rect (wl=" + (env && env.wl) + " wt=" + (env && env.wt) + " ww=" + (env && env.ww) + " wh=" + (env && env.wh) + ") — ABORTING (never guess by focus)");
     return;
   }
-  const win = await findWindowByPxRect(env.wl, env.wt, env.ww, env.wh);
+  const win = await findWindowByPxRect(env.wl, env.wt, env.ww, env.wh, env.lone !== false);
   if (!win) { dbg("capture-window: ABORTING teleport — dragged window not found (drag reverted/closed?)"); return; }
   if (!win.tabs || !win.tabs.length) return;
   // All tabs at once (each bounded by CAPTURE_INJECT_TIMEOUT_MS); Promise.all keeps the window's

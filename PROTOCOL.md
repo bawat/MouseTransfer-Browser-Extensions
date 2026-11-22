@@ -112,6 +112,20 @@ and sends its tabs to the peer as an `open` with `asWindow: true`.
 Optional (2.19+): `cid` — any JSON string or number Merged chooses to name this capture; the
 extension echoes it unchanged in `/source-kept`, so Merged knows which source window is meant.
 
+Optional (2.19+): `lone` — boolean. The extension's **single-window fallback** captures the only
+window it can see when no window's bounds match the rect; it exists for browsers whose skinned
+frame reports bounds that differ from the Win32 rect (QQ Browser). `"lone": false` turns that
+fallback off: no match means abort. Merged should send it for stock-frame browsers, where a
+miss means the dragged window is one the extension cannot see (an incognito/private window)
+and the fallback would capture — and then close — the user's other window. Absent means the
+fallback stays on (today's behaviour).
+
+The extension never captures an incognito/private window. On Chrome and Firefox its manifest
+sets `"incognito": "not_allowed"`, so it does not run in, or even see, private windows. Safari
+has no `not_allowed` (MDN browser-compat-data: `safari: false`), so there the extension skips
+windows whose `incognito` is true, and the single-window fallback applies only when the lone
+window is the only one it can see.
+
 After the peer's `ack` the extension closes **only the tabs it sent** (each still on the page it
 was sent from) and blank new-tab pages of that window. Any other tab — a `chrome://` page, a
 local file, a tab opened after the capture, a sent tab that navigated elsewhere — stays, and

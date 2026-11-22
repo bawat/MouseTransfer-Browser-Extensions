@@ -157,7 +157,7 @@ function makeChrome(opts, record, world, tools) {
   const ev = (name) => makeEvent(name, null);
   const storageChanged = ev("storage.onChanged");
   const winView = (win, populate) => {
-    const o = { id: win.id, left: win.left, top: win.top, width: win.width, height: win.height, focused: !!win.focused, type: win.type };
+    const o = { id: win.id, left: win.left, top: win.top, width: win.width, height: win.height, focused: !!win.focused, incognito: !!win.incognito, type: win.type };
     if (populate) o.tabs = win.tabs.map((t) => ({ ...t }));
     return o;
   };
