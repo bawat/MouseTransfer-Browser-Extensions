@@ -17,6 +17,13 @@ test("bakeYouTubeTime", async (t) => {
     ["https://www.youtube.com/watch?v=X#comments", 95, "https://www.youtube.com/watch?v=X&t=95s#comments"],
     ["https://www.youtube.com/watch?v=X&t=30#comments", 95, "https://www.youtube.com/watch?v=X&t=95s#comments"],
     ["https://youtu.be/ID#x", 5, "https://youtu.be/ID?t=5s#x"],
+    // t= in YouTube's h/m/s forms is replaced, not left beside the new one.
+    ["https://www.youtube.com/watch?v=X&t=1m30s", 95, "https://www.youtube.com/watch?v=X&t=95s"],
+    ["https://www.youtube.com/watch?t=1h2m3s&v=X", 95, "https://www.youtube.com/watch?v=X&t=95s"],
+    ["https://youtu.be/ID?t=2m", 95, "https://youtu.be/ID?t=95s"],
+    ["https://www.youtube.com/watch?v=X&t=2m&list=L", 95, "https://www.youtube.com/watch?v=X&list=L&t=95s"],
+    // not a time: left alone
+    ["https://www.youtube.com/watch?v=X&tt=5", 95, "https://www.youtube.com/watch?v=X&tt=5&t=95s"],
   ];
   for (const [url, secs, want] of cases) {
     await t.test(url, () => assert.equal(bake(url, secs), want));
