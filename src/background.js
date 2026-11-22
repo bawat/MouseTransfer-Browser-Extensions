@@ -72,7 +72,9 @@ const pendingClose = new Map();
 // (24817 first, 24812 second). Any other stored value is the user's and is kept as is. A stored
 // value equal to DEFAULT_ENDPOINT is treated as "no endpoint set" too (Options saved the default).
 async function loadConfig() {
-  const local = await chrome.storage.local.get(["endpoint", "token"]);
+  let local = {};
+  try { local = (await chrome.storage.local.get(["endpoint", "token"])) || {}; }
+  catch (e) { dbg("config: storage.local.get failed: " + e); }
   let ep = normEndpoint(local.endpoint);
   if (ep === LEGACY_ENDPOINT) {
     try { await chrome.storage.local.remove("endpoint"); } catch (e) {}
@@ -159,7 +161,7 @@ async function probeBridge() {
   bridge.next = 0; // a later re-probe starts again from the preferred port
   if (!cfg.token) {
     cfg.token = token;
-    await chrome.storage.local.set({ token }); // the token only: storing the endpoint is what pinned old installs to 24812
+    await storageSet("local", { token }, "token"); // the token only: storing the endpoint is what pinned old installs to 24812
     console.log("Teleporter: auto-configured from the Merged bridge at " + base);
   }
   if (moved || base !== cands[0]) dbg("bridge: using " + base + (base === LEGACY_ENDPOINT ? " (legacy port — an older wrapper)" : ""));
@@ -280,11 +282,42 @@ async function captureTab(tab) {
 // 2026-07-03). Mirror every pending close to chrome.storage.session (acked flag included) so a
 // resurrected worker — or a "recheck-closes" nudge from the wrapper, which watches the doomed
 // window by hwnd — can re-drive it to completion.
-async function pcLoad() { try { const s = await chrome.storage.session.get("mtPendClose"); return (s && s.mtPendClose) || {}; } catch (e) { return {}; } }
-function pcSave(m) { try { chrome.storage.session.set({ mtPendClose: m }); } catch (e) {} }
-async function pcSet(moveId, entry) { const m = await pcLoad(); m[moveId] = entry; pcSave(m); }
-async function pcMark(moveId, patch) { const m = await pcLoad(); if (m[moveId]) { Object.assign(m[moveId], patch); pcSave(m); } }
-async function pcDel(moveId) { const m = await pcLoad(); if (moveId in m) { delete m[moveId]; pcSave(m); } }
+//
+// Every update is a read-modify-write of ONE storage key, so updates are SERIALISED through pcChain:
+// two unordered updates (an ack's pcMark racing a pcDel, say) would otherwise each read the same
+// old map and the second write would silently undo the first. Reads go through the same chain, so
+// a read sees every update queued before it. A failed storage call is reported with dbg, never
+// thrown into the caller.
+let pcChain = Promise.resolve();
+async function pcLoadNow() {
+  try { const s = await chrome.storage.session.get("mtPendClose"); return (s && s.mtPendClose) || {}; }
+  catch (e) { dbg("pending-close registry: read failed: " + e); return {}; }
+}
+function pcQueue(op) { const p = pcChain.then(op); pcChain = p.catch(() => {}); return p; }
+function pcLoad() { return pcQueue(pcLoadNow); }
+// pcUpdate runs fn(map) in the queue; fn returns false when it changed nothing (skip the write).
+function pcUpdate(fn) {
+  return pcQueue(async () => {
+    const m = await pcLoadNow();
+    if (fn(m) === false) return;
+    try { await chrome.storage.session.set({ mtPendClose: m }); }
+    catch (e) { dbg("pending-close registry: write failed: " + e); }
+  });
+}
+function pcSet(moveId, entry) { return pcUpdate((m) => { m[moveId] = entry; }); }
+function pcMark(moveId, patch) { return pcUpdate((m) => { if (!m[moveId]) return false; Object.assign(m[moveId], patch); }); }
+function pcDel(moveId) { return pcUpdate((m) => { if (!(moveId in m)) return false; delete m[moveId]; }); }
+
+// storageSet writes to storage.local/session without letting a rejection escape unhandled (an
+// un-awaited set() inside try/catch catches nothing: the failure arrives later, as a rejection).
+function storageSet(area, items, what) {
+  try {
+    return chrome.storage[area].set(items).catch((e) => dbg("storage." + area + ".set failed (" + what + "): " + e));
+  } catch (e) {
+    dbg("storage." + area + ".set threw (" + what + "): " + e);
+    return Promise.resolve();
+  }
+}
 const closingNow = new Set(); // moveIds with a live closeWhenPossible loop (avoid duplicate loops per worker)
 
 // recheckCloses re-drives every ACKED pending close — from boot (worker resurrection) or a
@@ -519,7 +552,7 @@ async function wasColdLaunch() {
 let lastTeleportWin = null; // {id, at}
 function setLastTeleportWin(id) {
   lastTeleportWin = { id, at: Date.now() };
-  try { chrome.storage.session.set({ mtTeleWin: lastTeleportWin }); } catch (e) {}
+  storageSet("session", { mtTeleWin: lastTeleportWin }, "teleport window");
 }
 async function getLastTeleportWin() {
   if (lastTeleportWin) return lastTeleportWin;
@@ -849,13 +882,13 @@ const suppressCarryback = new Set();              // windowIds closed by a telep
 // resurrects a FRESH worker with empty in-memory state. So PROFILE_ROLE and the per-window tab cache are
 // mirrored to chrome.storage.session (survives suspension, cleared on browser close), and onWindowClosed
 // recovers them from there when the in-memory copies are empty (the close event woke a fresh worker).
-async function persistRole() { try { await chrome.storage.session.set({ mtRole: PROFILE_ROLE }); } catch (e) {} }
+function persistRole() { return storageSet("session", { mtRole: PROFILE_ROLE }, "profile role"); }
 function winTabsToObj() {
   const o = {};
   for (const [wid, m] of winTabs) { o[wid] = {}; for (const [tid, url] of m) o[wid][tid] = url; }
   return o;
 }
-function persistWinTabs() { try { chrome.storage.session.set({ mtWinTabs: winTabsToObj() }); } catch (e) {} }
+function persistWinTabs() { storageSet("session", { mtWinTabs: winTabsToObj() }, "window tabs"); }
 
 // resolveProfileRole asks the wrapper which profile we're in. /profile-role is ONE-SHOT on the wrapper
 // side, so it MUST be queried exactly once: boot() is invoked 3x at launch (bare + onStartup +
@@ -898,7 +931,7 @@ chrome.tabs.onRemoved.addListener((tabId, info) => {
   if (info.isWindowClosing) return;                 // whole window closing — KEEP the set for carry-back
   const m = winTabs.get(info.windowId); if (m) { m.delete(tabId); persistWinTabs(); } // single tab closed — don't carry it back
 });
-chrome.runtime.onSuspend.addListener(() => { try { chrome.storage.session.set({ mtWinTabs: winTabsToObj(), mtRole: PROFILE_ROLE }); } catch (e) {} });
+chrome.runtime.onSuspend.addListener(() => { storageSet("session", { mtWinTabs: winTabsToObj(), mtRole: PROFILE_ROLE }, "suspend"); });
 chrome.windows.onRemoved.addListener((windowId) => { onWindowClosed(windowId); });
 
 // ---- window/tab state push (for the wrapper's Yandex drag-from-maximize tab-blacklist) ----

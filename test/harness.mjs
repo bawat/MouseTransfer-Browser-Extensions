@@ -104,7 +104,9 @@ export function defaultRoute(req) {
 
 function deepCopy(v) { return v === undefined ? undefined : JSON.parse(JSON.stringify(v)); }
 
-function makeStorageArea(areaName, data, onChanged, record) {
+function makeStorageArea(areaName, data, onChanged, record, hook) {
+  // hook(area, op, arg) may return an Error to make that call reject (a full quota, a dead context).
+  const fail = (op, arg) => { const e = hook && hook(areaName, op, arg); return e ? Promise.reject(e) : null; };
   const pick = (keys) => {
     if (keys == null) return deepCopy(data);
     const list = typeof keys === "string" ? [keys] : Array.isArray(keys) ? keys : Object.keys(keys);
@@ -118,9 +120,10 @@ function makeStorageArea(areaName, data, onChanged, record) {
   const changed = (changes) => { if (Object.keys(changes).length) onChanged.fire(changes, areaName); };
   return {
     data,
-    get(keys, cb) { record(`storage.${areaName}.get`, keys); const r = pick(keys); if (cb) { cb(r); return undefined; } return Promise.resolve(r); },
+    get(keys, cb) { record(`storage.${areaName}.get`, keys); const f = fail("get", keys); if (f) return f; const r = pick(keys); if (cb) { cb(r); return undefined; } return Promise.resolve(r); },
     set(items, cb) {
       record(`storage.${areaName}.set`, items);
+      const f = fail("set", items); if (f) return f;
       const changes = {};
       for (const [k, v] of Object.entries(items)) { changes[k] = { oldValue: deepCopy(data[k]), newValue: deepCopy(v) }; data[k] = deepCopy(v); }
       changed(changes);
@@ -129,6 +132,7 @@ function makeStorageArea(areaName, data, onChanged, record) {
     },
     remove(keys, cb) {
       record(`storage.${areaName}.remove`, keys);
+      const f = fail("remove", keys); if (f) return f;
       const changes = {};
       for (const k of (Array.isArray(keys) ? keys : [keys])) if (k in data) { changes[k] = { oldValue: data[k] }; delete data[k]; }
       changed(changes);
@@ -190,8 +194,8 @@ function makeChrome(opts, record, world) {
     },
     storage: {
       onChanged: storageChanged,
-      local: makeStorageArea("local", { ...(opts.storage && opts.storage.local) }, storageChanged, record),
-      session: makeStorageArea("session", { ...(opts.storage && opts.storage.session) }, storageChanged, record),
+      local: makeStorageArea("local", { ...(opts.storage && opts.storage.local) }, storageChanged, record, opts.storageHook),
+      session: makeStorageArea("session", { ...(opts.storage && opts.storage.session) }, storageChanged, record, opts.storageHook),
     },
     alarms: {
       create: (name, info) => record("alarms.create", name, info),
@@ -293,6 +297,7 @@ function makeChrome(opts, record, world) {
 //   navigator: {...}                         the context's navigator (default: {} = a service worker
 //                                            without sendBeacon, as measured in Chromium)
 //   omitApis: ["bookmarks", "tabs.move"]     remove APIs to model an engine without them
+//   storageHook: (area, op, arg) => Error|undefined   make a storage call reject
 //   start: <ms>                              initial fake time
 //   settle: false                            skip the initial flush after load
 export async function loadBackground(opts = {}) {
