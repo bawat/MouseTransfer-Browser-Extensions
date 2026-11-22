@@ -453,6 +453,8 @@ async function teleportTab(tab) {
 // (Win32, px), trying each standard Windows scale factor (Settings > Display offers 100-250%)
 // to map px -> our DIP bounds. Returns null when nothing is plausibly close — the caller must
 // then ABORT rather than guess.
+const RECT_TIE_MARGIN = 4; // DIP: under 1 per edge, see the tie rule in findWindowByPxRect
+
 // allowLone=false forbids the single-window fallback below (capture-window "lone": false).
 async function findWindowByPxRect(wl, wt, ww, wh, allowLone = true) {
   let wins = [];
@@ -484,16 +486,37 @@ async function findWindowByPxRect(wl, wt, ww, wh, allowLone = true) {
   dbg("capture-window: want(px)=" + wl + "," + wt + "," + ww + "," + wh + " candidates=" +
       (normals.map(w => "#" + w.id + "[" + w.left + "," + w.top + "," + w.width + "," + w.height +
         " tabs=" + (w.tabs ? w.tabs.length : 0) + "]").join(" ") || "(none)"));
-  let best = null, bestD = Infinity;
-  for (const s of [1, 1.25, 1.5, 1.75, 2, 2.25, 2.5]) {
-    const want = { left: wl / s, top: wt / s, width: ww / s, height: wh / s };
-    for (const w of normals) {
+  // Each window's distance is its best over the scale factors; the best window is the nearest.
+  const dist = new Map();
+  for (const w of normals) {
+    let wd = Infinity;
+    for (const s of [1, 1.25, 1.5, 1.75, 2, 2.25, 2.5]) {
+      const want = { left: wl / s, top: wt / s, width: ww / s, height: wh / s };
       const d = Math.abs(w.left - want.left) + Math.abs(w.top - want.top) + Math.abs(w.width - want.width) + Math.abs(w.height - want.height);
-      if (d < bestD) { bestD = d; best = w; }
+      if (d < wd) wd = d;
     }
+    dist.set(w, wd);
   }
+  let best = null, bestD = Infinity;
+  for (const [w, d] of dist) if (d < bestD) { bestD = d; best = w; }
   if (best && bestD <= 200) {
-    dbg("capture-window: matched window #" + best.id + " (" + (best.tabs ? best.tabs.length : 0) + " tabs, bestD=" + Math.round(bestD) + ")");
+    // AMBIGUOUS: two windows with the same bounds (or near enough that the rect cannot tell them
+    // apart) both "match" — the first one listed used to win, which could capture and then CLOSE the
+    // wrong one. The focused window is the one being dragged; if none of the tied windows is focused,
+    // abort. RECT_TIE_MARGIN: chrome.windows bounds are whole DIPs, and mapping the px rect through a
+    // fractional scale (1.25, 1.75, …) leaves less than 1 DIP of rounding per edge, so two windows
+    // whose distances differ by less than one DIP per edge (4 edges) are indistinguishable.
+    const tied = normals.filter((w) => dist.get(w) <= bestD + RECT_TIE_MARGIN);
+    if (tied.length > 1) {
+      const focused = tied.filter((w) => w.focused);
+      if (focused.length !== 1) {
+        dbg("capture-window: " + tied.length + " windows match the dragged rect equally (" + tied.map((w) => "#" + w.id).join(",") + ") and " + (focused.length ? "several are" : "none is") + " focused — ABORTING (cannot tell which was dragged)");
+        return null;
+      }
+      dbg("capture-window: " + tied.length + " windows match the dragged rect equally — taking the focused one #" + focused[0].id);
+      best = focused[0];
+    }
+    dbg("capture-window: matched window #" + best.id + " (" + (best.tabs ? best.tabs.length : 0) + " tabs, bestD=" + Math.round(dist.get(best)) + ")");
     return best;
   }
   // Strict rect match FAILED. The rect is ONLY EVER a disambiguator among multiple windows — when
@@ -560,7 +583,10 @@ async function teleportFocusedWindow(env) {
   await pcSet(moveId, entry);
   // Tell the wrapper BEFORE the open goes out that this window will survive the teleport, so it
   // does not force-close it (it does that for close-confirm browsers). Optional endpoint.
-  if (kept > 0) reportSourceKept({ phase: "captured", moveId, cid, sent: sent.length, kept });
+  // AWAITED (bounded): the report must reach the wrapper BEFORE the open leaves — the peer's ack can
+  // only follow the open, and the wrapper force-closes an acked source window on close-confirm
+  // browsers unless it already knows the window keeps tabs. A 404 (older wrapper) returns at once.
+  if (kept > 0) await reportSourceKept({ phase: "captured", moveId, cid, sent: sent.length, kept });
   const ok = await sendEnvelope({ v: 1, kind: "open", moveId, asWindow: true, tabs });
   if (!ok) { pendingClose.delete(moveId); pcDel(moveId); }
   else console.log("Teleporter: sent window with", tabs.length, "tab(s)");
@@ -925,11 +951,14 @@ function sameDoc(a, b) {
 // (cmd/filedrag_windows.go watchDoomedSourceClose) — which would destroy the kept tabs. cid echoes
 // the capture-window envelope's "cid" so the wrapper can tell which window. POST /source-kept is
 // OPTIONAL: a wrapper that does not know it answers 404, which is ignored.
+// Returns a promise that settles when the bridge has answered (or after CAPTURE_INJECT_TIMEOUT_MS,
+// so a bridge that does not answer cannot hold a teleport); it never rejects.
 function reportSourceKept(info) {
   dbg("source-kept: " + info.phase + " moveId=" + info.moveId + " kept=" + info.kept + (info.sent !== undefined ? " sent=" + info.sent : ""));
   try {
-    bridgeFetch("/source-kept", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(info) }).catch(() => {});
-  } catch (e) {}
+    const p = bridgeFetch("/source-kept", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(info) });
+    return withTimeout(p, CAPTURE_INJECT_TIMEOUT_MS, "source-kept").then(() => {}, () => {});
+  } catch (e) { return Promise.resolve(); }
 }
 
 // planClose works out what is left to close for a pending-close entry, from the browser's CURRENT

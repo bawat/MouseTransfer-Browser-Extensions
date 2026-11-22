@@ -114,3 +114,33 @@ test("single tab: same page (only the #fragment changed) -> closed", async () =>
   await ack(h, open.moveId);
   assert.deepEqual(tabIds(h), [12]);
 });
+
+test("window: the /source-kept report has been ANSWERED before the open is sent", async () => {
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const { defaultRoute, response } = await import("./harness.mjs");
+  const h = await loadBackground({
+    windows: one([{ id: 11, url: "https://a.example/" }, { id: 12, url: "chrome://settings/" }]),
+    fetch: (req) => (req.path === "/source-kept" ? gate.then(() => response(204)) : defaultRoute(req)),
+  });
+  const p = h.fn("handleEnvelope")({ v: 1, kind: "capture-window", ...RECT });
+  await h.tick(200);
+  assert.equal(h.fetched("/source-kept").length, 1);
+  assert.equal(h.fetched("/send").length, 0, "the open must wait for the report's answer");
+  release();
+  await h.tick(200); await p;
+  assert.equal(sends(h).filter((e) => e.kind === "open").length, 1);
+});
+
+test("window: a /source-kept that never answers holds the open for at most the capture timeout", async () => {
+  const { defaultRoute, pending } = await import("./harness.mjs");
+  const h = await loadBackground({
+    windows: one([{ id: 11, url: "https://a.example/" }, { id: 12, url: "chrome://settings/" }]),
+    fetch: (req) => (req.path === "/source-kept" ? pending() : defaultRoute(req)),
+  });
+  const p = h.fn("handleEnvelope")({ v: 1, kind: "capture-window", ...RECT });
+  await h.tick(3000); await p;
+  const kept = h.fetched("/source-kept")[0], send = h.fetched("/send")[0];
+  assert.ok(send, "sent anyway");
+  assert.ok(send.at - kept.at >= 1000 && send.at - kept.at < 1500, `${send.at - kept.at} ms`);
+});

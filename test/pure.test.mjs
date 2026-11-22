@@ -82,3 +82,33 @@ test("findWindowByPxRect: a zero-size window is not a candidate", async () => {
   const w2 = await h.fn("findWindowByPxRect")(52, 52, 0, 0);
   assert.equal(w2.id, 1);
 });
+
+test("findWindowByPxRect: identical bounds -> the focused window, never simply the first listed", async () => {
+  const a = { ...win(1, 20, 20, 945, 1020, 1), focused: false };
+  const b = { ...win(2, 20, 20, 945, 1020, 2), focused: true };
+  const h = await loadBackground({ windows: [a, b] });
+  const w = await h.fn("findWindowByPxRect")(20, 20, 945, 1020);
+  assert.equal(w.id, 2);
+});
+
+test("findWindowByPxRect: identical bounds and none focused -> abort", async () => {
+  const h = await loadBackground({ windows: [win(1, 20, 20, 945, 1020), win(2, 20, 20, 945, 1020)] });
+  const w = await h.fn("findWindowByPxRect")(20, 20, 945, 1020);
+  assert.equal(w, null);
+  assert.ok(h.dbgLines().some((l) => /2 windows match the dragged rect equally .* none is focused/.test(l)), h.dbgLines().join("\n"));
+});
+
+test("findWindowByPxRect: a near-tie (within one DIP per edge) counts as a tie", async () => {
+  const a = { ...win(1, 20, 20, 945, 1020), focused: true };
+  const b = win(2, 21, 21, 945, 1020); // 2 DIP away in total
+  const h = await loadBackground({ windows: [b, a] });
+  const w = await h.fn("findWindowByPxRect")(21, 21, 945, 1020); // b is the exact match, a the focused one
+  assert.equal(w.id, 1);
+});
+
+// GUARD: a clear best match is not affected by the tie rule.
+test("findWindowByPxRect: windows far apart are not a tie", async () => {
+  const h = await loadBackground({ windows: [win(1, 20, 20, 945, 1020), { ...win(2, 400, 300, 945, 1020), focused: true }] });
+  const w = await h.fn("findWindowByPxRect")(20, 20, 945, 1020);
+  assert.equal(w.id, 1);
+});
