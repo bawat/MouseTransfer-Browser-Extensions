@@ -1173,28 +1173,40 @@ function resolveProfileRole() {
   return roleInFlight;
 }
 
+// Tab tracking exists only for carry-back, and only the TELEPORT profile ever carries a window back,
+// so only there are tabs tracked and mirrored to storage.session. In the normal profile (every
+// ordinary install) nothing is recorded or written. Until this worker knows its role (null: boot has
+// not resolved it yet) tabs are recorded in memory only, so a tab event that arrives first is not
+// lost; initWinTabs then keeps and persists them (teleport) or drops them (normal).
+function tracksTabs() { return PROFILE_ROLE === "teleport"; }
+function trackingOff() { return PROFILE_ROLE !== null && PROFILE_ROLE !== "teleport"; }
 function recordTab(windowId, tabId, url) {
-  if (windowId == null || tabId == null || !url || !/^https?:/i.test(url)) return;
+  if (trackingOff()) return;
+  if (windowId == null || tabId == null || !isWebUrl(url)) return;
   let m = winTabs.get(windowId);
   if (!m) { m = new Map(); winTabs.set(windowId, m); }
+  if (m.get(tabId) === url) return; // unchanged: nothing to write
   m.set(tabId, url);
-  persistWinTabs();
+  if (tracksTabs()) persistWinTabs();
 }
 async function initWinTabs() {
+  if (!tracksTabs()) { winTabs.clear(); return; }
   try { // recover a resurrected worker's cache first (the close event may have woken us)
     const s = await chrome.storage.session.get("mtWinTabs");
-    if (s && s.mtWinTabs) for (const wid in s.mtWinTabs) { const m = new Map(); for (const tid in s.mtWinTabs[wid]) m.set(tid, s.mtWinTabs[wid][tid]); winTabs.set(Number(wid), m); }
+    if (s && s.mtWinTabs) for (const wid in s.mtWinTabs) { const m = winTabs.get(Number(wid)) || new Map(); for (const tid in s.mtWinTabs[wid]) if (!m.has(Number(tid))) m.set(Number(tid), s.mtWinTabs[wid][tid]); winTabs.set(Number(wid), m); }
   } catch (e) {}
   try { for (const t of await chrome.tabs.query({})) recordTab(t.windowId, t.id, t.url || t.pendingUrl); } catch (e) {}
+  persistWinTabs();
 }
 chrome.tabs.onCreated.addListener((t) => recordTab(t.windowId, t.id, t.url || t.pendingUrl));
 chrome.tabs.onUpdated.addListener((tabId, info, t) => { if (t && (info.url || t.url)) recordTab(t.windowId, tabId, t.url); });
 chrome.tabs.onAttached.addListener(async (tabId, info) => { try { const t = await chrome.tabs.get(tabId); recordTab(info.newWindowId, tabId, t.url); } catch (e) {} });
 chrome.tabs.onRemoved.addListener((tabId, info) => {
   if (info.isWindowClosing) return;                 // whole window closing — KEEP the set for carry-back
-  const m = winTabs.get(info.windowId); if (m) { m.delete(tabId); persistWinTabs(); } // single tab closed — don't carry it back
+  if (trackingOff()) return;
+  const m = winTabs.get(info.windowId); if (m && m.delete(tabId) && tracksTabs()) persistWinTabs(); // single tab closed — don't carry it back
 });
-chrome.runtime.onSuspend.addListener(() => { storageSet("session", { mtWinTabs: winTabsToObj(), mtRole: PROFILE_ROLE }, "suspend"); });
+chrome.runtime.onSuspend.addListener(() => { if (tracksTabs()) storageSet("session", { mtWinTabs: winTabsToObj(), mtRole: PROFILE_ROLE }, "suspend"); });
 chrome.windows.onRemoved.addListener((windowId) => { onWindowClosed(windowId); });
 
 // ---- window/tab state push (for the wrapper's Yandex drag-from-maximize tab-blacklist) ----
@@ -1234,6 +1246,7 @@ if (chrome.windows.onBoundsChanged) chrome.windows.onBoundsChanged.addListener((
 // empty (the close event woke THIS worker, so boot()/initWinTabs hasn't repopulated them yet).
 async function onWindowClosed(windowId) {
   if (suppressCarryback.delete(windowId)) return;   // a teleport-away close — skip
+  if (PROFILE_ROLE === "normal") return;            // the normal profile never carries a window back
   // FAST PATH: in-memory state present (worker alive). Closing the teleport browser's LAST window makes
   // Chrome EXIT, killing any in-flight async work — so send SYNCHRONOUSLY here, before any await, via
   // sendCarryback (a keepalive fetch, or sendBeacon where the engine has one — see sendCarryback).
