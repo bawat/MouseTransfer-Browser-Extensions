@@ -92,12 +92,18 @@ async function pollLoop() {
   for (;;) {
     if (!cfg.token) { await ensureToken(); if (!cfg.token) { await sleep(2000); continue; } }
     try {
+      const askedAt = Date.now();
       const res = await fetch(q("/events"));
       if (res.status === 200) {
         const env = await res.json();
         await handleEnvelope(env);
       } else if (res.status !== 204) {
         await sleep(2000);
+      } else if (Date.now() - askedAt < 1000) {
+        // A 204 is the bridge's idle timeout and normally arrives after a long hold. One that
+        // comes back at once means the bridge is not holding the request, and re-asking with no
+        // pause would be the same tight loop as the lifeline's (see startLifeline).
+        await sleep(1000);
       }
     } catch (e) {
       await sleep(3000); // bridge down; back off and retry
@@ -646,21 +652,36 @@ chrome.contextMenus.onClicked.addListener((info, tab) => { if (info.menuItemId =
 // setInterval-based ping is NOT reliable — a setInterval is silently lost the moment the worker
 // is suspended, so the worker died and only the 30s alarm resurrected it, leaving a dead window
 // of up to ~30s where teleports "took ages". Three layers, strongest first:
-//   1) a PORT LIFELINE — an open runtime port continuously holds the worker alive (a connection,
-//      not a timer that can be lost). This is Google's documented MV3-transition workaround and
-//      is the reliable one on Chrome 109. Chrome force-disconnects ports at ~5 min, so we
-//      reconnect well before that for a fresh lease.
+//   1) a PORT LIFELINE — a runtime port this worker opens to its own extension. With another
+//      extension context present the port stays open and holds the worker alive (Chrome
+//      force-disconnects ports at ~5 min, so it is renewed before that). With none — the usual
+//      case — the browser refuses it at once, and the lifeline is then a slow retry whose refusal
+//      events are what keep the worker awake. See startLifeline for why it must never retry fast.
 //   2) an AWAITED getPlatformInfo loop (every 15s) as a secondary timer-based reset.
 //   3) a coarse alarm (0.5 min) that survives an actual eviction and re-enters pollLoop.
+// DO NOT RECONNECT A REFUSED PORT AT ONCE (2026-11-22). A browser delivers runtime.connect only to
+// OTHER contexts of the extension, never to the one that called it, and this worker is usually the
+// extension's only context. So the connect below is refused on the spot and onDisconnect fires
+// immediately. Reconnecting from that handler with no delay was a tight loop: measured, it held
+// the BROWSER process at a full CPU core for as long as the extension ran (a probe extension with
+// nothing but that code: 10.4 s of browser CPU per 10 s; without it: 0.02 s), and a browser main
+// thread that busy loses mouse clicks meant for Chrome's native title-bar menu.
+// A refused attempt is still an event delivered to this worker, and a delivered event is what
+// resets the worker's idle timer, so retrying on a SLOW beat keeps the keep-alive effect.
+const LIFELINE_RETRY_MS = 20000;   // comfortably inside the ~30s idle limit named above
+const LIFELINE_REFUSED_MS = 5000;  // a port that closed sooner than this was never really open
 let lifelinePort = null;
+let lifelineRetry = null;
 function startLifeline() {
-  if (lifelinePort) return;
+  if (lifelinePort || lifelineRetry) return;
+  const openedAt = Date.now();
   try {
     lifelinePort = chrome.runtime.connect({ name: "keepalive" });
     lifelinePort.onDisconnect.addListener(() => {
-      void chrome.runtime.lastError; // swallow "port closed" on reconnect
+      void chrome.runtime.lastError; // swallow "port closed" / "receiving end does not exist"
       lifelinePort = null;
-      startLifeline(); // immediately re-establish for the next ~5-min lease
+      if (Date.now() - openedAt >= LIFELINE_REFUSED_MS) { startLifeline(); return; } // a real lease ended: renew it
+      lifelineRetry = setTimeout(() => { lifelineRetry = null; startLifeline(); }, LIFELINE_RETRY_MS);
     });
   } catch (e) { lifelinePort = null; }
 }
