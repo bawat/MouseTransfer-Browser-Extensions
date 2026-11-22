@@ -73,6 +73,8 @@ Merged does not parse these — both extensions must agree on them. Always inclu
   browser window); when false/absent it opens `tabs[0]` as a single tab (a one-tab send).
 - `tabs` — one or more tabs. Fields beyond `url` are best-effort restore hints; a receiver
   restores what it can and ignores the rest. `active` marks the tab to focus.
+- A receiver opens **only** `http:`/`https:` URLs (checked with a real URL parse) and drops
+  every other entry. If no tab survives, it does not ack, so the sender keeps its tab(s).
 - `videoTime` — seconds into the first `<video>`. (Chrome also bakes YouTube time into
   the URL via `&t=Ns` since that restores most reliably.)
 

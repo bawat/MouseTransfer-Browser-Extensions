@@ -503,6 +503,18 @@ function scheduleRestore(tabId, t) {
   setTimeout(() => chrome.tabs.onUpdated.removeListener(onUpdated), 20000); // stop listening eventually
 }
 
+// isWebUrl reports whether u parses as an absolute http: or https: URL (a real parse, so
+// " javascript:…", "HTTP:" spellings and relative junk are judged as the browser would judge them).
+function isWebUrl(u) {
+  if (typeof u !== "string" || !u) return false;
+  try { const p = new URL(u); return p.protocol === "http:" || p.protocol === "https:"; } catch (e) { return false; }
+}
+// urlScheme names a URL's scheme for a log line without revealing the rest of it.
+function urlScheme(u) {
+  if (typeof u !== "string" || !u) return "(empty)";
+  try { return new URL(u).protocol; } catch (e) { return "(unparsable)"; }
+}
+
 // isBlankTabUrl reports whether a URL is a blank / new-tab page (a startup window's idle tab).
 function isBlankTabUrl(u) {
   u = ((u || "") + "").toLowerCase();
@@ -685,7 +697,16 @@ async function handleEnvelope(env) {
   if (env.kind === "recheck-closes") { await recheckCloses("wrapper nudge"); return; }
 
   if (env.kind === "open") {
-    const tabs = (env.tabs || []).filter((t) => t && t.url);
+    // Open ONLY http(s) pages. A sender captures nothing else, so anything else in an envelope is
+    // malformed or hostile (file://, chrome://, javascript:, data: …) and is dropped here, before
+    // ANY path below (adopt, create, single tab) can see it. Nothing survives -> no ack, so the
+    // sender keeps its tabs.
+    const all = Array.isArray(env.tabs) ? env.tabs : [];
+    const tabs = all.filter((t) => t && isWebUrl(t.url));
+    if (tabs.length < all.length) {
+      const schemes = all.filter((t) => !(t && isWebUrl(t.url))).map((t) => urlScheme(t && t.url));
+      dbg("open " + env.moveId + ": dropped " + (all.length - tabs.length) + " of " + all.length + " tab(s) that are not http(s) (" + schemes.join(", ") + ")");
+    }
     if (!tabs.length) return;
 
     if (env.asWindow) {
